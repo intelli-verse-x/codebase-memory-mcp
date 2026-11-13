@@ -441,6 +441,43 @@ TEST(minhash_hex_roundtrip) {
     PASS();
 }
 
+TEST(minhash_hex_exact_capacity_and_known_values) {
+    cbm_minhash_t fp = {0};
+    fp.values[1] = UINT32_MAX;
+    fp.values[2] = 0x01234567U;
+    fp.values[3] = 0x89ABCDEFU;
+    unsigned char guarded[CBM_MINHASH_HEX_BUF + 2];
+    memset(guarded, 0x5A, sizeof(guarded));
+    char *hex = (char *)&guarded[1];
+    cbm_minhash_to_hex(&fp, hex, CBM_MINHASH_HEX_BUF);
+    ASSERT_EQ(guarded[0], 0x5A);
+    ASSERT_EQ(guarded[sizeof(guarded) - 1], 0x5A);
+    ASSERT_EQ((int)strlen(hex), CBM_MINHASH_HEX_LEN);
+    ASSERT_MEM_EQ(hex, "00000000ffffffff0123456789abcdef", 32);
+    for (int i = 32; i < CBM_MINHASH_HEX_LEN; i++) {
+        ASSERT_EQ(hex[i], '0');
+    }
+    PASS();
+}
+
+TEST(minhash_hex_rejects_every_short_capacity) {
+    cbm_minhash_t fp = {0};
+    unsigned char guarded[CBM_MINHASH_HEX_BUF + 2];
+    for (int size = -1; size < CBM_MINHASH_HEX_BUF; size++) {
+        memset(guarded, 0x5A, sizeof(guarded));
+        cbm_minhash_to_hex(&fp, (char *)&guarded[1], size);
+        for (int i = 0; i < (int)sizeof(guarded); i++) {
+            ASSERT_EQ(guarded[i], (i == 1 && size > 0) ? 0 : 0x5A);
+        }
+    }
+    memset(guarded, 0x5A, sizeof(guarded));
+    cbm_minhash_to_hex(NULL, (char *)&guarded[1], CBM_MINHASH_HEX_BUF);
+    ASSERT_EQ(guarded[1], 0);
+    ASSERT_EQ(guarded[2], 0x5A);
+    cbm_minhash_to_hex(&fp, NULL, CBM_MINHASH_HEX_BUF);
+    PASS();
+}
+
 TEST(lsh_same_bucket_similar) {
     /* Two fingerprints with Jaccard ≈ 0.97 (62/64 match) should share a bucket */
     cbm_minhash_t a, b;
@@ -1228,6 +1265,8 @@ SUITE(simhash) {
     RUN_TEST(jaccard_disjoint);
     RUN_TEST(jaccard_partial_overlap);
     RUN_TEST(minhash_hex_roundtrip);
+    RUN_TEST(minhash_hex_exact_capacity_and_known_values);
+    RUN_TEST(minhash_hex_rejects_every_short_capacity);
     RUN_TEST(lsh_same_bucket_similar);
     RUN_TEST(lsh_different_bucket_dissimilar);
     RUN_TEST(lsh_reused_seen_set_matches_fresh_query);

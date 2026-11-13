@@ -307,10 +307,16 @@ void cbm_minhash_to_hex(const cbm_minhash_t *fp, char *buf, int bufsize) {
         }
         return;
     }
-    int pos = 0;
+    static const char hex_digits[] = "0123456789abcdef";
     for (int i = 0; i < CBM_MINHASH_K; i++) {
-        pos += snprintf(buf + pos, (size_t)(bufsize - pos), "%08x", fp->values[i]);
+        /* Each uint32 has exactly eight hex digits. Fixed offsets avoid
+         * accumulating snprintf's would-have-written return value. */
+        for (int digit = 0; digit < HEX_CHARS_PER_U32; digit++) {
+            unsigned shift = (unsigned)(HEX_CHARS_PER_U32 - 1 - digit) * 4U;
+            buf[i * HEX_CHARS_PER_U32 + digit] = hex_digits[(fp->values[i] >> shift) & 0xFU];
+        }
     }
+    buf[CBM_MINHASH_HEX_LEN] = '\0';
 }
 
 bool cbm_minhash_from_hex(const char *hex, cbm_minhash_t *out) {

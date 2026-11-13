@@ -75,6 +75,8 @@ jobs:
           persist-credentials: false
       - name: Check out the merge base's selection tooling
         run: git worktree add --detach "$RUNNER_TEMP/base-tooling" HEAD^1
+      - name: Test first-sync full-suite fallback
+        run: python3 -m unittest discover -s .github/tests -p test_selection_bootstrap.py -v
       - name: Build the merge base's engine
         timeout-minutes: 20
         run: |
@@ -86,6 +88,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # A large synchronization can introduce the selector for the first
+          # time. Never substitute PR tooling for the trusted base's helper:
+          # an absent base helper must select the complete existing test suite.
+          if [ ! -f "$RUNNER_TEMP/base-tooling/scripts/ci/test-impact-select.sh" ]; then
+            echo "::notice::Trusted base has no test selector; running all tests"
+            printf 'selection=all\nportable=all\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           "$RUNNER_TEMP/base-tooling/scripts/ci/test-impact-select.sh" --repo "$GITHUB_WORKSPACE" \
             --binary "$RUNNER_TEMP/base-tooling/build/c/codebase-memory-mcp" \
             --out "$RUNNER_TEMP/test-impact" --gate "$RUNNER_TEMP/test-selection"

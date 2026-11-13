@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 MATH_TS = (
     "export function add(a: number, b: number): number { return a + b; }\n"
@@ -67,16 +68,33 @@ def main():
         # CLI path itself works and isolating the failure to argv encoding.
         ascii_repo = os.path.join(work, "ascii_repo")
         make_fixture(ascii_repo)
-        env = dict(os.environ)
-        env["CBM_CACHE_DIR"] = os.path.join(work, "cache_ascii")
-        ctrl = subprocess.run(
-            [binary, "cli", "index_repository",
-             json.dumps({"repo_path": ascii_repo})],
-            capture_output=True, timeout=120, env=env)
-        ctrl_out = (ctrl.stdout or b"").decode("utf-8", "replace")
+        # The control is setup, not the surface under test: a cold runner can
+        # lose the first one-shot to coordination-daemon startup latency
+        # (#1952). One retry against a fresh cache separates that from a real
+        # CLI indexing failure.
+        ctrl_out = ""
+        ctrl_err = ""
+        for attempt in ("cache_ascii", "cache_ascii_retry"):
+            env = dict(os.environ)
+            env["CBM_CACHE_DIR"] = os.path.join(work, attempt)
+            ctrl = subprocess.run(
+                [binary, "cli", "index_repository",
+                 json.dumps({"repo_path": ascii_repo})],
+                capture_output=True, timeout=120, env=env)
+            ctrl_out = (ctrl.stdout or b"").decode("utf-8", "replace")
+            ctrl_err = (ctrl.stderr or b"").decode("utf-8", "replace")
+            if '"nodes"' in ctrl_out:
+                break
+            # Full stdout AND stderr: the reason lives on stderr (daemon
+            # spawn/handshake diagnostics), and a head slice of stdout only
+            # ever showed the allocator preamble.
+            print("SETUP: ASCII control attempt %r did not index via CLI (rc=%s):\n"
+                  "stdout:\n%s\nstderr:\n%s"
+                  % (attempt, ctrl.returncode, ctrl_out, ctrl_err))
+            time.sleep(2)
         if '"nodes"' not in ctrl_out:
-            print("SETUP FAIL: ASCII control did not index via CLI:\n%s" %
-                  ctrl_out[:300])
+            print("SETUP FAIL: ASCII control did not index via CLI:\nstdout:\n%s\nstderr:\n%s"
+                  % (ctrl_out, ctrl_err))
             return 2
 
         env2 = dict(os.environ)
@@ -98,6 +116,28 @@ def main():
         print("non-ASCII argv (supervised): rc=%d" % p.returncode)
         print("  stdout: %s" % out[:200].replace("\n", " "))
         print("  stderr: %s" % err[-200:].replace("\n", " "))
+        # #973 variant: the reporter's exact shape — Traditional-Chinese dir,
+        # FLAG-form --repo-path + --mode fast, supervised. This adds coverage
+        # of the flag->JSON converter and the repo-path canonicalization,
+        # which used ANSI _access/_fullpath (locale-dependent — corrupted CJK
+        # paths on CJK-codepage systems) before the cbm_canonical_path fix.
+        cjk_repo = os.path.join(work, "\u96f7\u9054\u6e2c\u8a66")
+        make_fixture(cjk_repo)
+        env3 = dict(os.environ)
+        env3["CBM_CACHE_DIR"] = os.path.join(work, "cache_cjk")
+        env3.pop("CBM_INDEX_SUPERVISOR", None)
+        p2 = subprocess.run([binary, "cli", "index_repository",
+                             "--repo-path", cjk_repo, "--mode", "fast"],
+                            capture_output=True, timeout=120, env=env3)
+        out2 = (p2.stdout or b"").decode("utf-8", "replace")
+        cjk_ok = '"nodes"' in out2 and '"nodes":0' not in out2.replace(" ", "")
+        print("CJK flag-form (--repo-path, supervised, fast): rc=%d" % p2.returncode)
+        print("  stdout: %s" % out2[:200].replace("\n", " "))
+        if not cjk_ok:
+            print("\nRED: CJK flag-form repo_path was not indexed (#973 — "
+                  "canonicalization or spawn boundary mangled the path).")
+            return 1
+
         if honored:
             print("\nGREEN: CLI honored the non-ASCII repo_path (argv + worker spawn).")
             return 0

@@ -6,8 +6,9 @@
 # Exports:
 #   ARCH        — target architecture (arm64 / x86_64)
 #   ARCHFLAGS   — "-arch <arch>" on macOS (target slice for clang/ld), empty elsewhere
+#   MAKE        — make program for Makefile.cbm (gmake on FreeBSD, make elsewhere)
 #   NPROC       — number of CPU cores
-#   OS          — darwin / linux / windows
+#   OS          — darwin / linux / windows / freebsd
 
 set -euo pipefail
 
@@ -16,9 +17,21 @@ OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$OS" in
     darwin)  OS="darwin" ;;
     linux)   OS="linux" ;;
+    freebsd*) OS="freebsd" ;;
     mingw*|msys*|cygwin*) OS="windows" ;;
     *)       OS="unknown" ;;
 esac
+
+# ── Select the make program ────────────────────────────────────
+# Makefile.cbm is written in GNU make syntax. FreeBSD ships BSD make as its
+# default make, so builds there run gmake (pkg install gmake); every other
+# platform runs make. Not exported: build.sh sources this file and runs
+# $MAKE in the same shell.
+if [[ "$OS" == "freebsd" ]]; then
+    MAKE="gmake"
+else
+    MAKE="make"
+fi
 
 # ── Detect / override architecture ─────────────────────────────
 # Default: native HARDWARE architecture (not Rosetta-translated).
@@ -98,8 +111,35 @@ if [[ -z "${CC:-}" ]]; then
     fi
 fi
 
+# ── Verified compiler cache (ccache, opt-out CBM_NO_CCACHE=1) ──
+# Activated through ccache's masquerade directories so $CC keeps its plain
+# name everywhere (verify_compiler, make, link lines are untouched).
+# Zero-staleness guarantee: CCACHE_COMPILERCHECK=content keys every entry on
+# the CONTENT of the compiler binary plus the fully preprocessed translation
+# unit, so a cache hit is provably the identical compilation — a stale or
+# foreign cache can only MISS, never return wrong output. No CCACHE_BASEDIR
+# and no path rewriting: debug-info and sanitizer report paths stay exact.
+if [[ "${CBM_NO_CCACHE:-0}" != "1" ]] && command -v ccache >/dev/null 2>&1; then
+    for _cbm_ccache_masq in \
+        /usr/lib/ccache \
+        /opt/homebrew/opt/ccache/libexec \
+        /usr/local/opt/ccache/libexec \
+        /clang64/lib/ccache/bin \
+        /clangarm64/lib/ccache/bin; do
+        if [[ -d "$_cbm_ccache_masq" ]]; then
+            case ":$PATH:" in
+            *":$_cbm_ccache_masq:"*) ;;
+            *) PATH="$_cbm_ccache_masq:$PATH" ;;
+            esac
+        fi
+    done
+    unset _cbm_ccache_masq
+    export PATH
+    export CCACHE_COMPILERCHECK=content
+fi
+
 # ── Print environment summary ──────────────────────────────────
 print_env() {
     local context="$1"
-    echo "=== $context: os=$OS arch=$ARCH cores=$NPROC cc=${CC:-default} cxx=${CXX:-default} ==="
+    echo "=== $context: os=$OS arch=$ARCH cores=$NPROC cc=${CC:-default} cxx=${CXX:-default} make=$MAKE ==="
 }

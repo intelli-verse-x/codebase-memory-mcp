@@ -5,6 +5,7 @@
  * Handles Python __init__.py, JS/TS index.{js,ts}, path separators.
  */
 #include "pipeline/pipeline.h"
+#include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/platform.h"
 
@@ -62,9 +63,21 @@ static char *join_segments(const char **segments, int count) {
 }
 
 /* Strip file extension from the last path component. */
+/* A container build file named for its variant ("Dockerfile.debug") keeps
+ * the suffix: it is no language extension, and dropping it would give the
+ * variant the QN of the plain Dockerfile beside it. Mirrors strip_ext_len in
+ * internal/cbm/helpers.c -- both must agree. */
+static bool fqn_build_file_variant(const char *base) {
+    return strncmp(base, "Dockerfile.", strlen("Dockerfile.")) == 0 ||
+           strncmp(base, "Containerfile.", strlen("Containerfile.")) == 0;
+}
+
 static void strip_file_extension(char *path) {
     char *last_slash = strrchr(path, '/');
     char *start = last_slash ? last_slash + SKIP_ONE : path;
+    if (fqn_build_file_variant(start)) {
+        return;
+    }
     char *ext = strrchr(start, '.');
     if (ext) {
         *ext = '\0';
@@ -116,7 +129,19 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
 
     char *path = strdup(rel_path ? rel_path : "");
     cbm_normalize_path_sep(path);
-    strip_file_extension(path);
+    /* #1077/#964: File-node QNs (name=="__file__") must preserve the full
+     * filename so sibling files sharing a stem get DISTINCT nodes — e.g.
+     * .env / .env.local / .env.production (which all strip to ".env" and
+     * collide, so only one survives per directory), and a C/C++ header vs
+     * its same-stem .cpp. Extension stripping stays for MODULE/symbol QNs
+     * (name==NULL or a symbol): that stem unification is load-bearing for
+     * C/C++ declaration↔definition cross-file resolution. All 26 __file__
+     * QN sites route through here, so creation and every lookup stay
+     * consistent. */
+    bool is_file_qn = name && strcmp(name, "__file__") == 0;
+    if (!is_file_qn) {
+        strip_file_extension(path);
+    }
 
     const char *segments[CBM_SZ_256];
     int seg_count = 0;
@@ -269,19 +294,18 @@ static char *resolve_python_relative(char *buf, size_t buf_size, const char *mod
     return strdup(buf);
 }
 
-/* Strip a trailing file extension from a segment (e.g. "helpers.ts" → "helpers").
- * Returns the new segment length. */
-static size_t strip_ext(const char *seg_start, size_t seg_len) {
-    const char *seg_end = seg_start + seg_len;
-    const char *dot = NULL;
-    for (const char *d = seg_end - FQN_SEP_LEN; d >= seg_start; d--) {
-        if (*d == '.') {
-            dot = d;
-            break;
+/* Strip an explicit JS/TS module file extension while preserving dots that are
+ * part of an extensionless basename (e.g. "featureX.engine"). */
+static size_t strip_js_module_ext(const char *seg_start, size_t seg_len) {
+    static const char *const extensions[] = {
+        ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".json",
+    };
+    for (size_t i = 0; i < sizeof(extensions) / sizeof(extensions[0]); i++) {
+        size_t ext_len = strlen(extensions[i]);
+        if (seg_len > ext_len &&
+            memcmp(seg_start + seg_len - ext_len, extensions[i], ext_len) == 0) {
+            return seg_len - ext_len;
         }
-    }
-    if (dot && dot > seg_start) {
-        return (size_t)(dot - seg_start);
     }
     return seg_len;
 }
@@ -305,11 +329,14 @@ static char *resolve_js_relative(char *buf, size_t buf_size, const char *module_
             continue;
         }
         if (seg_len == FQN_DOTDOT_LEN && seg_start[0] == '.' && seg_start[FQN_SEP_LEN] == '.') {
+            if (!buf[0]) {
+                return NULL;
+            }
             path_pop_segment(buf);
             continue;
         }
         if (*p == '\0') {
-            seg_len = strip_ext(seg_start, seg_len);
+            seg_len = strip_js_module_ext(seg_start, seg_len);
         }
         if (seg_len > 0 && !path_append_segment(buf, buf_size, seg_start, seg_len)) {
             return NULL;
@@ -329,6 +356,30 @@ char *cbm_pipeline_resolve_relative_import(const char *source_rel, const char *m
         return resolve_python_relative(buf, sizeof(buf), module_path);
     }
     return resolve_js_relative(buf, sizeof(buf), module_path);
+}
+
+size_t cbm_pipeline_fqn_symbol_prefix_len(const char *project, const char *rel_path) {
+    if (!project) {
+        return 0;
+    }
+    char path[FQN_PATH_BUF];
+    int n = snprintf(path, sizeof(path), "%s", rel_path ? rel_path : "");
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return 0;
+    }
+    cbm_normalize_path_sep(path);
+    strip_file_extension(path);
+    const char *segments[CBM_SZ_256];
+    int seg_count = 0;
+    segments[seg_count++] = project;
+    seg_count += tokenize_path(path, segments + seg_count, FQN_MAX_PATH_SEGS);
+    /* Any symbol name: the prefix cbm_pipeline_fqn_compute puts before it. */
+    strip_init_or_index(segments, &seg_count, "symbol");
+    size_t total = 0;
+    for (int i = 0; i < seg_count; i++) {
+        total += strlen(segments[i]) + (i > 0 ? FQN_SEP_LEN : 0);
+    }
+    return total;
 }
 
 char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir) {
@@ -410,20 +461,19 @@ char *cbm_project_name_from_path(const char *abs_path) {
 
     char real[CBM_SZ_4K];
     const char *name_path = abs_path;
-#ifdef _WIN32
-    if (_access(abs_path, 0) == 0 && _fullpath(real, abs_path, sizeof(real))) {
+    /* Wide-path canonicalization — the ANSI _access/_fullpath pair corrupted
+     * CJK paths on CJK-locale Windows (#973). */
+    if (cbm_canonical_path(abs_path, real, sizeof(real))) {
         cbm_normalize_path_sep(real);
         name_path = real;
     }
-#else
-    if (realpath(abs_path, real)) {
-        cbm_normalize_path_sep(real);
-        name_path = real;
-    }
-#endif
+    return cbm_project_name_sanitize(name_path);
+}
 
-    /* Work on mutable copy */
-    char *path = strdup(name_path);
+char *cbm_project_name_sanitize(const char *name_path) {
+    /* Work on mutable copy. NULL and "" map to "" and fall through to the
+     * empty-after-trim "root" return below. */
+    char *path = strdup(name_path ? name_path : "");
     if (!path) {
         return NULL;
     }

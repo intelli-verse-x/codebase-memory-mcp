@@ -16,8 +16,10 @@
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
+#include <pipeline/pipeline_internal.h>
 #include <foundation/log.h>
 #include <foundation/mem.h>
+#include <foundation/platform.h>
 
 #include <stdarg.h>
 #include <string.h>
@@ -106,7 +108,20 @@ static int reformat_files(const char *subdir, int max_files) {
 static char *index_repo(void) {
     char args[512];
     snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", g_repodir);
-    return cbm_mcp_handle_tool(g_srv, "index_repository", args);
+    char *resp = cbm_mcp_handle_tool(g_srv, "index_repository", args);
+    /* Fail-closed at the source: every caller asserts resp != NULL, but an
+     * error response (e.g. a transient pre-publication abort that preserves
+     * the previous index) used to slip through and cascade into dozens of
+     * mysterious count/query failures downstream — a 99-test pile-up on the
+     * Windows leg traced back to exactly this. Surface the real cause once,
+     * here, and let the existing non-NULL asserts fail loudly. */
+    if (resp && strstr(resp, "\"isError\":true")) {
+        fprintf(stderr, "  index_repo: index_repository returned an error response:\n  %.400s\n",
+                resp);
+        free(resp);
+        return NULL;
+    }
+    return resp;
 }
 
 /* Timed index: returns response, sets *elapsed_ms and *peak_rss_mb */
@@ -127,7 +142,9 @@ static char *call_tool(const char *tool, const char *args_fmt, ...) {
     return cbm_mcp_handle_tool(g_srv, tool, args);
 }
 
-/* Parse integer from JSON response (handles nested MCP envelope) */
+/* Parse integer from a tool response (handles the nested MCP envelope).
+ * Matches the JSON forms "key":N / \"key\":N and the TOON scalar `key: N`
+ * (search_graph default output since the compact-output change). */
 static int count_in_response(const char *resp, const char *key) {
     if (!resp)
         return -1;
@@ -140,13 +157,17 @@ static int count_in_response(const char *resp, const char *key) {
     p = strstr(resp, pattern);
     if (p)
         return atoi(p + strlen(pattern));
+    snprintf(pattern, sizeof(pattern), "%s: ", key);
+    p = strstr(resp, pattern);
+    if (p)
+        return atoi(p + strlen(pattern));
     return -1;
 }
 
 /* ── Direct store queries (more reliable than MCP for tests) ────── */
 
 static cbm_store_t *open_store(void) {
-    return cbm_store_open_path(g_dbpath);
+    return cbm_store_open_path_existing(g_dbpath);
 }
 
 static int get_node_count(void) {
@@ -202,39 +223,69 @@ static int incremental_setup(void) {
 
     snprintf(g_repodir, sizeof(g_repodir), "%s/fastapi", g_tmpdir);
 
-    /* On CI, use sparse checkout to skip docs/ and tests/ (~62% of files).
-     * Cuts indexing time roughly in half on slow shared runners. */
-    char cmd[1024];
-    if (getenv("CI")) {
-        snprintf(cmd, sizeof(cmd),
-                 "git clone --depth=1 --branch 0.99.1 --quiet --filter=blob:none "
-                 "--sparse https://github.com/fastapi/fastapi.git '%s' 2>&1 && "
-                 "cd '%s' && git sparse-checkout set --no-cone '/*' '!/docs' '!/tests' 2>&1",
-                 g_repodir, g_repodir);
+    /* The fixture is cloned from the network at most once per machine, into a
+     * persistent cache; every run local-clones from there (seconds, offline).
+     * The one-time clone is staged and committed with an atomic rename so a
+     * torn download can never masquerade as a valid cache. */
+    const char *cache_home = getenv("CBM_TEST_FIXTURE_CACHE");
+    char cache_root[512];
+    if (cache_home && cache_home[0]) {
+        snprintf(cache_root, sizeof(cache_root), "%s", cache_home);
     } else {
+        const char *home = getenv("HOME");
+        if (!home || !home[0])
+            home = ".";
+        snprintf(cache_root, sizeof(cache_root), "%s/.cache/cbm-test-fixtures", home);
+    }
+    char cache_repo[640];
+    snprintf(cache_repo, sizeof(cache_repo), "%s/fastapi-0.99.1", cache_root);
+    char cmd[1600];
+    if (!cbm_is_dir(cache_repo)) {
+        (void)cbm_mkdir_p(cache_root, 0700);
+        char cache_stage[700];
+        snprintf(cache_stage, sizeof(cache_stage), "%s.stage", cache_repo);
+        th_rmtree(cache_stage);
         snprintf(cmd, sizeof(cmd),
                  "git clone --depth=1 --branch 0.99.1 --quiet "
                  "https://github.com/fastapi/fastapi.git '%s' 2>&1",
-                 g_repodir);
+                 cache_stage);
+        int fetch_rc = system(cmd);
+        if (fetch_rc != 0 || rename(cache_stage, cache_repo) != 0) {
+            th_rmtree(cache_stage);
+            if (!cbm_is_dir(cache_repo)) {
+                printf("  fixture clone failed (rc=%d) — network offline?\n", fetch_rc);
+                return -1;
+            }
+        }
     }
+    snprintf(cmd, sizeof(cmd), "git clone --quiet '%s' '%s' 2>&1", cache_repo, g_repodir);
     int rc = system(cmd);
     if (rc != 0) {
-        printf("  clone failed (rc=%d) — network offline?\n", rc);
+        printf("  fixture local clone failed (rc=%d)\n", rc);
         return -1;
     }
+    /* Index the same corpus everywhere: CI historically indexed a sparse
+     * checkout without docs/ and tests/ (the assertion thresholds are sized
+     * for it) while local runs indexed the full tree — twice the files for
+     * the identical assertions, and a local/CI divergence. Trimming the two
+     * directories is the portable equivalent of that sparse profile. */
+    char trim[600];
+    snprintf(trim, sizeof(trim), "%s/docs", g_repodir);
+    th_rmtree(trim);
+    snprintf(trim, sizeof(trim), "%s/tests", g_repodir);
+    th_rmtree(trim);
 
     g_project = cbm_project_name_from_path(g_repodir);
     if (!g_project)
         return -1;
 
-    const char *home = getenv("HOME");
-    if (!home)
-        home = "/tmp";
-    snprintf(g_dbpath, sizeof(g_dbpath), "%s/.cache/codebase-memory-mcp/%s.db", home, g_project);
-
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
-    cbm_mkdir(cache_dir);
+    const char *cache_dir = cbm_resolve_cache_dir();
+    int dbpath_length =
+        cache_dir ? snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db", cache_dir, g_project) : -1;
+    if (dbpath_length <= 0 || (size_t)dbpath_length >= sizeof(g_dbpath) ||
+        !cbm_mkdir_p(cache_dir, 0700)) {
+        return -1;
+    }
 
     unlink(g_dbpath);
 
@@ -326,7 +377,26 @@ TEST(incr_full_index) {
         rss_limit_mb = 2816;
     }
 #endif
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#define CBM_TEST_RSS_BUDGET_UNMEASURABLE 1
+#endif
+#endif
+#if defined(CBM_TEST_RSS_BUDGET_UNMEASURABLE)
+    /* MSan maps shadow (and with origins, a second) mapping for every
+     * allocation, inflating RSS by construction: this index measured 3054MB
+     * against the 2304MB budget on the x86-64 lane. The budget exists to catch
+     * a REAL leak (GBs over) in a normal build; under MSan it cannot separate a
+     * leak from shadow, so the number is not evidence either way. Skipped here
+     * rather than inflated, so the guard keeps its teeth on every other
+     * platform -- inflating it would blind the check where it does work. The
+     * rest of this test (node/edge correctness) still runs under MSan, which is
+     * the uninitialized-read coverage the lane exists for. */
+    (void)rss_delta_mb;
+    (void)rss_limit_mb;
+#else
     ASSERT_LT((int)rss_delta_mb, rss_limit_mb);
+#endif
 
     printf("    [perf] full: %d nodes, %d edges (%d CALLS, %d IMPORTS) "
            "in %.0fms, peak=%zuMB\n",
@@ -474,6 +544,71 @@ TEST(incr_formatter_run) {
     printf("    [perf] reformat 50 files: %.0fms, node_diff=%d edge_diff=%d\n", ms, node_diff,
            edge_diff);
 
+    PASS();
+}
+
+static char g_purge_log[8192];
+static int g_purge_progress_lines;
+
+static void purge_log_sink(const char *line) {
+    if (!line || !strstr(line, "msg=incremental.purge")) {
+        return;
+    }
+    if (strstr(line, "msg=incremental.purge.progress")) {
+        g_purge_progress_lines++;
+    }
+    size_t used = strlen(g_purge_log);
+    (void)snprintf(g_purge_log + used, sizeof(g_purge_log) - used, "%s\n", line);
+}
+
+/* #1300: the per-file purge after incremental.edge_snapshot logged nothing
+ * until it finished, so a stall there left no trace of where the run was. It
+ * now announces its counts and reports bounded progress — counts only, at
+ * most 20 progress lines however many files, ending at files_done ==
+ * files_total. */
+TEST(incr_purge_reports_bounded_progress_issue1300) {
+    char *resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    reformat_files("fastapi", 30);
+    /* The loop instrumented for #1300 sits on the legacy partial route (the
+     * production closure route purges in SQL and logs delta.snapshot_purge). */
+    cbm_pipeline_incremental_test_force_legacy_partial_once();
+
+    CBMLogLevel saved_level = cbm_log_get_level();
+    CBMLogFormat saved_format = cbm_log_get_format();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    g_purge_log[0] = '\0';
+    g_purge_progress_lines = 0;
+    cbm_log_set_sink_ex(purge_log_sink, CBM_LOG_SINK_TEE);
+    resp = index_repo();
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(saved_level);
+    cbm_log_set_format(saved_format);
+    ASSERT(resp != NULL);
+    ASSERT(strstr(resp, "indexed") != NULL);
+    free(resp);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+
+    const char *start = strstr(g_purge_log, "msg=incremental.purge.start");
+    ASSERT(start != NULL);
+    int changed = -1;
+    int deleted = -1;
+    const char *changed_at = strstr(start, "changed=");
+    const char *deleted_at = strstr(start, "deleted=");
+    ASSERT(changed_at != NULL && deleted_at != NULL);
+    changed = atoi(changed_at + strlen("changed="));
+    deleted = atoi(deleted_at + strlen("deleted="));
+    int total = changed + deleted;
+    ASSERT_GT(total, 20); /* enough files that one line per file would exceed the bound */
+    ASSERT_GT(g_purge_progress_lines, 0);
+    ASSERT(g_purge_progress_lines <= 21);
+    ASSERT(g_purge_progress_lines < total); /* never one line per file */
+    char last[64];
+    (void)snprintf(last, sizeof(last), "files_done=%d files_total=%d", total, total);
+    ASSERT(strstr(g_purge_log, last) != NULL);
+    ASSERT(strstr(g_purge_log, "msg=incremental.purge elapsed_ms=") != NULL);
     PASS();
 }
 
@@ -860,6 +995,16 @@ TEST(incr_perf_single_file_fast) {
     }
 
     delete_file_at("fastapi/incr_perf_probe.py");
+    /* Publish the cleanup too. search_code now consumes the complete scoped
+     * file list and fails closed when the graph names a source file that grep
+     * cannot read; leaving this probe indexed would make every later matching
+     * search correctly report an incomplete snapshot instead of exercising
+     * the search parameter contract this fixture is meant to cover. The
+     * cleanup reindex is deliberately outside the measured interval above. */
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    ASSERT(strstr(resp, "indexed") != NULL);
+    free(resp);
     PASS();
 }
 
@@ -928,6 +1073,14 @@ static int resp_has_key(const char *resp, const char *key) {
     if (strstr(resp, pattern) != NULL)
         return 1;
     snprintf(pattern, sizeof(pattern), "\\\"%s\\\"", key);
+    if (strstr(resp, pattern) != NULL)
+        return 1;
+    /* TOON scalar form (`key: value`), the search_graph default output. */
+    snprintf(pattern, sizeof(pattern), "%s: ", key);
+    if (strstr(resp, pattern) != NULL)
+        return 1;
+    /* TOON table-header form (`key[N]{...}:`), used by trace_path. */
+    snprintf(pattern, sizeof(pattern), "%s[", key);
     return strstr(resp, pattern) != NULL;
 }
 
@@ -949,6 +1102,36 @@ static int resp_lacks_key(const char *resp, const char *key) {
 #define NOT_ERROR(resp) ASSERT(strstr((resp), "\"isError\":true") == NULL)
 
 /* ── list_projects ─────────────────────────────────────────────── */
+
+TEST(incr_file_node_name_stays_basename) {
+    /* #994: File nodes must keep their basename NAME through an incremental
+     * re-index (the bug renamed touched files' nodes to rel_path, diverging
+     * from a full build). Modify a file, re-index, assert no File node name
+     * contains a path separator. */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/fastapi/applications.py", g_repodir);
+    FILE *f = fopen(path, "a");
+    ASSERT(f != NULL);
+    fprintf(f, "\n# incr_file_node_name_stays_basename touch\n");
+    fclose(f);
+
+    char *resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+
+    double ms;
+    char *r = call_tool_timed("query_graph", &ms,
+                              "{\"project\":\"%s\",\"format\":\"json\","
+                              "\"query\":\"MATCH (n:File) WHERE n.name CONTAINS '/'"
+                              " RETURN n.name LIMIT 5\"}",
+                              g_project);
+    TOOL_OK(r, ms);
+    /* No File node may carry a path separator in its name; the query engine
+     * returns an empty rows array when nothing matches. */
+    ASSERT(strstr(r, "\"rows\":[]") != NULL || strstr(r, "\\\"rows\\\":[]") != NULL);
+    free(r);
+    PASS();
+}
 
 TEST(tool_list_projects_basic) {
     double ms;
@@ -1474,26 +1657,29 @@ TEST(tool_qg_two_hop) {
 
 TEST(tool_qg_max_rows) {
     double ms;
-    /* Query without max_rows — gets many results */
+    /* Query without max_rows — its explicit Cypher LIMIT is the visible cap. */
     char *r1 = call_tool_timed("query_graph", &ms,
                                "{\"project\":\"%s\","
                                "\"query\":\"MATCH (n:Function) RETURN n.name LIMIT 100\"}",
                                g_project);
     TOOL_OK(r1, ms);
-    int total_unlimited = count_in_response(r1, "total");
+    int returned_unlimited = count_in_response(r1, "returned");
     free(r1);
 
-    /* Same query without LIMIT but with max_rows=3 — must cap results */
+    /* max_rows caps presentation, not evaluation: returned is bounded while
+     * total remains the exact full materialized count. */
     char *r2 = call_tool_timed("query_graph", &ms,
                                "{\"project\":\"%s\","
                                "\"query\":\"MATCH (n:Function) RETURN n.name\","
                                "\"max_rows\":3}",
                                g_project);
     TOOL_OK(r2, ms);
+    int returned_limited = count_in_response(r2, "returned");
     int total_limited = count_in_response(r2, "total");
-    ASSERT_LTE(total_limited, 3);
-    /* Without max_rows should have more than with */
-    ASSERT_GT(total_unlimited, total_limited);
+    ASSERT_EQ(returned_limited, 3);
+    ASSERT_GT(total_limited, returned_limited);
+    ASSERT_GT(returned_unlimited, returned_limited);
+    ASSERT_NOT_NULL(strstr(r2, "page_limit"));
     free(r2);
     PASS();
 }
@@ -1814,13 +2000,47 @@ TEST(tool_arch_no_aspects) {
 
 TEST(tool_detect_changes_default) {
     double ms;
-    char *r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\"}", g_project);
+    /* The fixture is intentionally detached, so pin only the base while
+     * exercising every other default (scope, direction, depth, and budget). */
+    char *r = call_tool_timed("detect_changes", &ms,
+                              "{\"project\":\"%s\",\"base_branch\":\"HEAD\"}", g_project);
     TOOL_OK(r, ms);
-    /* Must have changed_files array and changed_count */
-    ASSERT(resp_has_key(r, "changed_files"));
-    ASSERT(resp_has_key(r, "changed_count"));
-    ASSERT(resp_has_key(r, "impacted_symbols"));
-    ASSERT(resp_has_key(r, "depth"));
+    NOT_ERROR(r);
+    /* Lean tree contract: preserve exact changed-file accounting, but do not
+     * spend tokens on a zero-row table. A non-empty page still carries the
+     * changed_files rows; an empty page is represented by its exact scalars. */
+    int changed_total = count_in_response(r, "changed_total");
+    int changed_returned = count_in_response(r, "changed_returned");
+    ASSERT_GTE(changed_total, 0);
+    ASSERT_GTE(changed_returned, 0);
+    ASSERT_LTE(changed_returned, changed_total);
+    ASSERT(changed_returned > 0 ? resp_has_key(r, "changed_files")
+                                : resp_lacks_key(r, "changed_files"));
+    ASSERT(strstr(r, "direction:") != NULL);
+    ASSERT(strstr(r, "seed_symbols:") != NULL);
+    free(r);
+    PASS();
+}
+
+/* The blast radius is a REAL traversal now: default inbound gives transitive
+ * callers of the changed symbols with an exact impacted_total and a module
+ * rollup. Fixture diff may be empty (shallow clone at HEAD) — the sections and
+ * their accounting must still be present and internally consistent. */
+TEST(tool_detect_changes_impact_shape) {
+    double ms;
+    char *r = call_tool_timed("detect_changes", &ms,
+                              "{\"project\":\"%s\",\"base_branch\":\"HEAD\"}", g_project);
+    TOOL_OK(r, ms);
+    ASSERT(strstr(r, "direction: inbound") != NULL); /* default = blast radius */
+    ASSERT(strstr(r, "seed_symbols:") != NULL);
+    /* format:"json" returns the same model as structured JSON. */
+    free(r);
+    r = call_tool_timed("detect_changes", &ms,
+                        "{\"project\":\"%s\",\"base_branch\":\"HEAD\",\"format\":\"json\"}",
+                        g_project);
+    TOOL_OK(r, ms);
+    ASSERT(resp_has_key(r, "impacted_total"));
+    ASSERT(resp_has_key(r, "direction"));
     free(r);
     PASS();
 }
@@ -1843,7 +2063,15 @@ TEST(tool_detect_changes_since) {
     char *r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\",\"since\":\"HEAD\"}",
                               g_project);
     TOOL_OK(r, ms);
-    ASSERT(resp_has_key(r, "changed_files"));
+    NOT_ERROR(r);
+    ASSERT(strstr(r, "base: HEAD") != NULL);
+    int changed_total = count_in_response(r, "changed_total");
+    int changed_returned = count_in_response(r, "changed_returned");
+    ASSERT_GTE(changed_total, 0);
+    ASSERT_GTE(changed_returned, 0);
+    ASSERT_LTE(changed_returned, changed_total);
+    ASSERT(changed_returned > 0 ? resp_has_key(r, "changed_files")
+                                : resp_lacks_key(r, "changed_files"));
     free(r);
     PASS();
 }
@@ -2144,8 +2372,11 @@ TEST(tool_qg_max_rows_1) {
                               "\"max_rows\":1}",
                               g_project);
     TOOL_OK(r, ms);
+    int returned = count_in_response(r, "returned");
     int total = count_in_response(r, "total");
-    ASSERT_EQ(total, 1);
+    ASSERT_EQ(returned, 1);
+    ASSERT_GT(total, returned);
+    ASSERT_NOT_NULL(strstr(r, "page_limit"));
     free(r);
     PASS();
 }
@@ -2956,6 +3187,7 @@ SUITE(incremental) {
 
     /* Phase 3: Incremental deltas */
     RUN_TEST(incr_modify_file);
+    RUN_TEST(incr_file_node_name_stays_basename);
     RUN_TEST(incr_formatter_run);
     RUN_TEST(incr_add_file);
     RUN_TEST(incr_delete_file);
@@ -3055,6 +3287,7 @@ SUITE(incremental) {
 
     /* Phase 15: detect_changes */
     RUN_TEST(tool_detect_changes_default);
+    RUN_TEST(tool_detect_changes_impact_shape);
     RUN_TEST(tool_detect_changes_custom_branch);
     RUN_TEST(tool_detect_changes_since);
     RUN_TEST(tool_detect_changes_since_precedence);
@@ -3181,6 +3414,9 @@ SUITE(incremental) {
     RUN_TEST(tool_err_adr_bad_project);
     RUN_TEST(tool_err_ingest_bad_project);
     RUN_TEST(tool_err_ingest_no_traces);
+
+    /* #1300: legacy-partial purge progress (the full rebuild below resets the graph) */
+    RUN_TEST(incr_purge_reports_bounded_progress_issue1300);
 
     /* Phase 40: index_repository mode=full + arch empty aspects */
     RUN_TEST(tool_index_mode_full);

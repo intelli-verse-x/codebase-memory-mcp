@@ -238,14 +238,36 @@ static void es_lang_cleanup(ES_LangProj *lp, cbm_store_t *store) {
 }
 
 /* Every graph edge type the pipeline can emit — used in diagnostic dumps. */
-static const char *ES_ALL_EDGE_TYPES[] = {
-    "CALLS",        "CONFIGURES",    "CONTAINS_FILE", "CONTAINS_FOLDER",
-    "DATA_FLOWS",   "DECORATES",     "DEFINES",       "DEFINES_METHOD",
-    "DEPENDS_ON",   "FILE_CHANGES_WITH", "GRAPHQL_CALLS", "GRPC_CALLS",
-    "HANDLES",      "HTTP_CALLS",    "IMPLEMENTS",    "IMPORTS",
-    "INHERITS",     "INFRA_MAPS",    "OVERRIDE",      "SEMANTICALLY_RELATED",
-    "SIMILAR_TO",   "TESTS_FILE",    "TESTS",         "TRPC_CALLS",
-    "USAGE",        "ASYNC_CALLS",   NULL};
+static const char *ES_ALL_EDGE_TYPES[] = {"CALLS",
+                                          "CALL_REFERENCE",
+                                          "CONFIGURES",
+                                          "CONTAINS_FILE",
+                                          "CONTAINS_FOLDER",
+                                          "DATA_FLOWS",
+                                          "DECORATES",
+                                          "DEFINES",
+                                          "DEFINES_METHOD",
+                                          "DEPENDS_ON",
+                                          "FILE_CHANGES_WITH",
+                                          "GRAPHQL_CALLS",
+                                          "GRPC_CALLS",
+                                          "HANDLES",
+                                          "HTTP_CALLS",
+                                          "IMPLEMENTS",
+                                          "IMPORTS",
+                                          "INHERITS",
+                                          "INFRA_MAPS",
+                                          "MENTIONS",
+                                          "OVERRIDE",
+                                          "REFERENCES_FILE",
+                                          "SEMANTICALLY_RELATED",
+                                          "SIMILAR_TO",
+                                          "TESTS_FILE",
+                                          "TESTS",
+                                          "TRPC_CALLS",
+                                          "USAGE",
+                                          "ASYNC_CALLS",
+                                          NULL};
 
 static void es_dump_edge_histogram(cbm_store_t *store, const char *project) {
     if (!store) {
@@ -276,6 +298,40 @@ static int es_edge_present(const ES_LangFile *files, int nfiles, const char *edg
     }
     es_lang_cleanup(&lp, store);
     return got >= floor;
+}
+
+static int es_exact_edge_by_name(const ES_LangFile *files, int nfiles, const char *edge_type,
+                                 const char *source_name, const char *target_name) {
+    ES_LangProj lp;
+    cbm_store_t *store = es_lang_index_files(&lp, files, nfiles);
+    cbm_node_t *sources = NULL;
+    cbm_node_t *targets = NULL;
+    int source_count = 0;
+    int target_count = 0;
+    int matches = -1;
+    if (store &&
+        cbm_store_find_nodes_by_name(store, lp.project, source_name, &sources, &source_count) ==
+            CBM_STORE_OK &&
+        cbm_store_find_nodes_by_name(store, lp.project, target_name, &targets, &target_count) ==
+            CBM_STORE_OK &&
+        source_count == 1 && target_count == 1) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (cbm_store_find_edges_by_source_type(store, sources[0].id, edge_type, &edges,
+                                                &edge_count) == CBM_STORE_OK) {
+            matches = 0;
+            for (int i = 0; i < edge_count; i++) {
+                if (edges[i].target_id == targets[0].id) {
+                    matches++;
+                }
+            }
+        }
+        cbm_store_free_edges(edges, edge_count);
+    }
+    cbm_store_free_nodes(sources, source_count);
+    cbm_store_free_nodes(targets, target_count);
+    es_lang_cleanup(&lp, store);
+    return matches;
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -350,6 +406,32 @@ TEST(es_calls_crossfile_typescript) {
          "import { format } from './util';\n\n"
          "export function run(input: string): string {\n    return format(input);\n}\n"}};
     ASSERT_TRUE(es_edge_present(f, 2, "CALLS", 1)); /* run -> format */
+    PASS();
+}
+
+TEST(es_calls_vue_embedded_issue1410) {
+    static const ES_LangFile f[] = {
+        {"App.vue",
+         "<template><p>Vue</p></template>\n"
+         "<script setup lang=\"ts\">\n"
+         "function callee(): number { return 42; }\n"
+         "function caller(): number { return callee(); }\n"
+         "</script>\n"},
+    };
+    ASSERT_EQ(es_exact_edge_by_name(f, 1, "CALLS", "caller", "callee"), 1);
+    PASS();
+}
+
+TEST(es_calls_svelte_embedded_issue1807) {
+    static const ES_LangFile f[] = {
+        {"Toggle.svelte",
+         "<script lang=\"ts\">\n"
+         "function callee(): number { return 42; }\n"
+         "function caller(): number { return callee(); }\n"
+         "</script>\n"
+         "<button on:click={caller}>Toggle</button>\n"},
+    };
+    ASSERT_EQ(es_exact_edge_by_name(f, 1, "CALLS", "caller", "callee"), 1);
     PASS();
 }
 
@@ -744,16 +826,31 @@ TEST(es_decorates_attribute_csharp) {
  * resolves in the registry.  pass_usages.c handles this.
  * ══════════════════════════════════════════════════════════════════ */
 
-/* Python cross-file USAGE: main.py uses a class from models.py. */
+/* Python ClassName() with a user __init__ is a CALLS edge to that method.
+ * The Class node no longer receives the instantiation edge. A class with no
+ * user __init__ still targets the Class (lsp_constructor). */
 TEST(es_usage_crossfile_python) {
     static const ES_LangFile f[] = {
         {"models.py",
          "class User:\n    def __init__(self, name):\n        self.name = name\n"},
         {"main.py",
          "from .models import User\n\n\ndef create_user(name):\n    return User(name)\n"}};
-    /* Uncertain: USAGE edges for type instantiation may or may not be
-     * extracted for Python.  Assert the correct outcome. */
-    ASSERT_TRUE(es_edge_present(f, 2, "USAGE", 1));
+    ASSERT_EQ(es_exact_edge_by_name(f, 2, "CALLS", "create_user", "__init__"), 1);
+    ASSERT_EQ(es_exact_edge_by_name(f, 2, "CALLS", "create_user", "User"), 0);
+    PASS();
+}
+
+/* Issue #1642 repro: build() -> Embedder.__init__, not the Embedder class. */
+TEST(es_calls_python_constructor_init) {
+    static const ES_LangFile f[] = {
+        {"main.py", "class Embedder:\n"
+                    "    def __init__(self, model=\"x\"):\n"
+                    "        self.model = model\n"
+                    "\n"
+                    "def build():\n"
+                    "    return Embedder(model=\"y\")\n"}};
+    ASSERT_EQ(es_exact_edge_by_name(f, 1, "CALLS", "build", "__init__"), 1);
+    ASSERT_EQ(es_exact_edge_by_name(f, 1, "CALLS", "build", "Embedder"), 0);
     PASS();
 }
 
@@ -861,6 +958,8 @@ SUITE(edge_structural) {
     RUN_TEST(es_calls_crossfile_java);
     RUN_TEST(es_calls_crossfile_kotlin);
     RUN_TEST(es_calls_crossfile_csharp);
+    RUN_TEST(es_calls_vue_embedded_issue1410);
+    RUN_TEST(es_calls_svelte_embedded_issue1807);
 
     /* ── FAMILY 2: INHERITS cross-file ────────────────────────── */
     /* GREEN: Java, C#, C++ (extraction confirmed correct). */
@@ -900,6 +999,7 @@ SUITE(edge_structural) {
     /* ── FAMILY 7: USAGE cross-file ─────────────────────────── */
     /* Uncertain: depends on USAGE extraction for each language. */
     RUN_TEST(es_usage_crossfile_python);
+    RUN_TEST(es_calls_python_constructor_init);
     RUN_TEST(es_usage_crossfile_typescript);
     RUN_TEST(es_usage_crossfile_go);
 

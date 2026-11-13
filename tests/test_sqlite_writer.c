@@ -8,10 +8,12 @@
  * bypassing the SQL parser entirely. These tests verify integrity.
  */
 #include "../src/foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "test_framework.h"
 /* sqlite_writer.h is at internal/cbm/ — Makefile adds -Iinternal/cbm */
 #include "sqlite_writer.h" /* CBMDumpNode, CBMDumpEdge, cbm_write_db */
 #include "sqlite3.h"       /* vendored/sqlite3/ via -Ivendored/sqlite3 */
+#include <errno.h>
 #include <unistd.h>
 
 /* ── Helper: create temp file path ─────────────────────────────── */
@@ -23,6 +25,120 @@ static int make_temp_db(char *path, size_t pathsz) {
         return -1;
     close(fd);
     return 0;
+}
+
+static int assert_node_name(sqlite3 *db, const char *expected) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT name FROM nodes WHERE id=1", -1, &stmt, NULL);
+    ASSERT_EQ(rc, SQLITE_OK);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), expected);
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+static int write_fixture_file(const char *path, const char *contents) {
+    FILE *fp = cbm_fopen(path, "wb");
+    if (!fp) {
+        return -1;
+    }
+    size_t len = strlen(contents);
+    size_t written = fwrite(contents, 1, len, fp);
+    int close_rc = fclose(fp);
+    return written == len && close_rc == 0 ? 0 : -1;
+}
+
+static int fixture_file_equals(const char *path, const char *expected) {
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        return 0;
+    }
+    char buf[64] = {0};
+    size_t n = fread(buf, 1, sizeof(buf), fp);
+    int close_rc = fclose(fp);
+    size_t expected_len = strlen(expected);
+    return close_rc == 0 && n == expected_len && memcmp(buf, expected, expected_len) == 0;
+}
+
+static int count_temp_outputs_for(const char *path) {
+    char dir[256];
+    char base[256];
+    const char *slash = strrchr(path, '/');
+#ifdef _WIN32
+    const char *backslash = strrchr(path, '\\');
+    if (!slash || (backslash && backslash > slash)) {
+        slash = backslash;
+    }
+#endif
+    if (slash) {
+        size_t dir_len = (size_t)(slash - path);
+        if (dir_len == 0 || dir_len >= sizeof(dir)) {
+            return -1;
+        }
+        memcpy(dir, path, dir_len);
+        dir[dir_len] = '\0';
+        snprintf(base, sizeof(base), "%s", slash + 1);
+    } else {
+        snprintf(dir, sizeof(dir), ".");
+        snprintf(base, sizeof(base), "%s", path);
+    }
+
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return -1;
+    }
+    size_t base_len = strlen(base);
+    int count = 0;
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        size_t name_len = strlen(ent->name);
+        if (name_len > base_len + 5 && strncmp(ent->name, base, base_len) == 0 &&
+            strncmp(ent->name + base_len, ".tmp.", 5) == 0) {
+            count++;
+        }
+    }
+    cbm_closedir(d);
+    return count;
+}
+
+/* Locate the writer's temp output for `path`. Same naming rule as
+ * count_temp_outputs_for, but returns the full path of the first match. */
+static int find_temp_output_for(const char *path, char *out, size_t out_size) {
+    char dir[256];
+    char base[256];
+    const char *slash = strrchr(path, '/');
+    if (slash) {
+        size_t dir_len = (size_t)(slash - path);
+        if (dir_len == 0 || dir_len >= sizeof(dir)) {
+            return -1;
+        }
+        memcpy(dir, path, dir_len);
+        dir[dir_len] = '\0';
+        snprintf(base, sizeof(base), "%s", slash + 1);
+    } else {
+        snprintf(dir, sizeof(dir), ".");
+        snprintf(base, sizeof(base), "%s", path);
+    }
+
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return -1;
+    }
+    size_t base_len = strlen(base);
+    int found = -1;
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        size_t name_len = strlen(ent->name);
+        if (name_len > base_len + 5 && strncmp(ent->name, base, base_len) == 0 &&
+            strncmp(ent->name + base_len, ".tmp.", 5) == 0) {
+            snprintf(out, out_size, "%s/%s", dir, ent->name);
+            found = 0;
+            break;
+        }
+    }
+    cbm_closedir(d);
+    return found;
 }
 
 /* ── Tests ─────────────────────────────────────────────────────── */
@@ -541,6 +657,85 @@ TEST(sw_multi_page) {
     PASS();
 }
 
+/* Write n nodes of project "p" whose names are key_size bytes long, then run
+ * the #1783 coverage-shadow wipe shape: a DELETE for a project key that sorts
+ * after every written row ("p::missed" > "p"), so each (project, ...) index is
+ * searched down its rightmost path. Returns the DELETE's result code (-1 on a
+ * setup failure) and the SQLite message in err_out. */
+static int sw_write_long_names_and_wipe(int n, int key_size, char *err_out, size_t err_sz) {
+    char path[256];
+    if (make_temp_db(path, sizeof(path)) != 0) {
+        return -1;
+    }
+    CBMDumpNode *nodes = calloc((size_t)n, sizeof(*nodes));
+    char *names = calloc((size_t)n, (size_t)key_size + 1);
+    char *qns = calloc((size_t)n, (size_t)key_size + 3);
+    int rc = -1;
+    if (nodes && names && qns) {
+        for (int i = 0; i < n; i++) {
+            char *name = names + (size_t)i * ((size_t)key_size + 1);
+            char *qn = qns + (size_t)i * ((size_t)key_size + 3);
+            int prefix = snprintf(name, (size_t)key_size + 1, "n%06d_", i);
+            memset(name + prefix, 'x', (size_t)key_size - (size_t)prefix);
+            name[key_size] = '\0';
+            snprintf(qn, (size_t)key_size + 3, "p.%s", name);
+            nodes[i] = (CBMDumpNode){
+                .id = i + 1,
+                .project = "p",
+                .label = "Function",
+                .name = name,
+                .qualified_name = qn,
+                .file_path = "large.c",
+                .start_line = i + 1,
+                .end_line = i + 1,
+                .properties = "{}",
+            };
+        }
+        int wrc = cbm_write_db(path, "p", "/r", "2026-08-26T00:00:00Z", nodes, n, NULL, 0, NULL, 0,
+                               NULL, 0);
+        rc = wrc == 0 ? SQLITE_OK : -1;
+    }
+    free(nodes);
+    free(names);
+    free(qns);
+    /* INDEXED BY pins the seek to the long-key index; left alone the planner
+     * picks the short-key idx_nodes_label (one leaf page, never affected). */
+    static const char *wipe =
+        "DELETE FROM nodes INDEXED BY idx_nodes_name WHERE project = 'p::missed'";
+    sqlite3 *db = NULL;
+    if (rc == SQLITE_OK && sqlite3_open(path, &db) == SQLITE_OK) {
+        char *error = NULL;
+        rc = sqlite3_exec(db, wipe, NULL, NULL, &error);
+        snprintf(err_out, err_sz, "%s", error ? error : "none");
+        sqlite3_free(error);
+    }
+    sqlite3_close(db);
+    unlink(path);
+    return rc;
+}
+
+/* #1783: an index whose interior level spans several pages must never end that
+ * level with a page holding zero cells (only a right-child pointer). SQLite
+ * rejects such a page as SQLITE_CORRUPT the moment a cursor descends into it,
+ * and a key sorting after every row — the coverage-shadow wipe's
+ * "<project>::missed" — descends exactly there, the rightmost path. With
+ * 12000-byte keys a 64 KB page holds 5 leaf cells (4 after promotion) and 5
+ * interior cells, so 33 rows give 7 leaves = 5 cells + right child on the
+ * first interior page, leaving ONE child for the second. The sweep covers one
+ * and two interior levels; before the fix rows 31-35, 61-65 and 91-95 failed. */
+TEST(sw_interior_level_never_ends_with_empty_page) {
+    enum { KEY_SIZE = 12000, MIN_ROWS = 2, MAX_ROWS = 120 };
+    for (int rows = MIN_ROWS; rows <= MAX_ROWS; rows++) {
+        char err[256] = "";
+        int rc = sw_write_long_names_and_wipe(rows, KEY_SIZE, err, sizeof(err));
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "  rows=%d wipe rc=%d err=%s\n", rows, rc, err);
+        }
+        ASSERT_EQ(rc, SQLITE_OK);
+    }
+    PASS();
+}
+
 /* ── Oversized node: properties JSON > 65KB triggers overflow pages ─ */
 
 TEST(sw_oversized_node) {
@@ -605,7 +800,268 @@ TEST(sw_oversized_node) {
     PASS();
 }
 
+TEST(sw_stream_open_does_not_truncate_destination) {
+    char path[256];
+    ASSERT_EQ(make_temp_db(path, sizeof(path)), 0);
+
+    const char sentinel[] = "old-db-visible-until-finalize";
+    ASSERT_EQ(write_fixture_file(path, sentinel), 0);
+
+    cbm_db_writer_t *w = cbm_writer_open(path);
+    ASSERT(w != NULL);
+
+    char buf[64] = {0};
+    FILE *fp = cbm_fopen(path, "rb");
+    ASSERT(fp != NULL);
+    size_t n = fread(buf, 1, sizeof(sentinel) - 1, fp);
+    ASSERT_EQ(fclose(fp), 0);
+    ASSERT_EQ(n, sizeof(sentinel) - 1);
+    ASSERT_EQ(memcmp(buf, sentinel, sizeof(sentinel) - 1), 0);
+
+    int rc = cbm_writer_finalize(w, "test", "/tmp/test", "2026-07-07T00:00:00Z", NULL, 0, NULL, 0,
+                                 NULL, 0, NULL, 0);
+    ASSERT_EQ(rc, 0);
+
+    sqlite3 *db = NULL;
+    rc = sqlite3_open(path, &db);
+    ASSERT_EQ(rc, SQLITE_OK);
+
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &stmt, NULL);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "ok");
+    sqlite3_finalize(stmt);
+
+    sqlite3_close(db);
+    cbm_unlink(path);
+    PASS();
+}
+
+TEST(sw_publish_removes_destination_sidecars) {
+    char path[256];
+    ASSERT_EQ(make_temp_db(path, sizeof(path)), 0);
+
+    char wal[320];
+    char shm[320];
+    snprintf(wal, sizeof(wal), "%s-wal", path);
+    snprintf(shm, sizeof(shm), "%s-shm", path);
+
+    ASSERT_EQ(write_fixture_file(wal, "stale-wal"), 0);
+    ASSERT_EQ(write_fixture_file(shm, "stale-shm"), 0);
+
+    int rc = cbm_write_db(path, "test", "/tmp/test", "2026-07-07T00:00:00Z", NULL, 0, NULL, 0, NULL,
+                          0, NULL, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT(!fixture_file_equals(wal, "stale-wal"));
+    ASSERT(!fixture_file_equals(shm, "stale-shm"));
+
+    sqlite3 *db = NULL;
+    rc = sqlite3_open(path, &db);
+    ASSERT_EQ(rc, SQLITE_OK);
+
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &stmt, NULL);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "ok");
+    sqlite3_finalize(stmt);
+
+    sqlite3_close(db);
+    cbm_unlink(path);
+    PASS();
+}
+
+TEST(sw_publish_failure_preserves_destination_sidecars) {
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/cbm_sw_dir_XXXXXX");
+    ASSERT(cbm_mkdtemp(path) != NULL);
+
+    char wal[320];
+    char shm[320];
+    snprintf(wal, sizeof(wal), "%s-wal", path);
+    snprintf(shm, sizeof(shm), "%s-shm", path);
+    ASSERT_EQ(write_fixture_file(wal, "live-wal"), 0);
+    ASSERT_EQ(write_fixture_file(shm, "live-shm"), 0);
+
+    int rc = cbm_write_db(path, "test", "/tmp/test", "2026-07-07T00:00:00Z", NULL, 0, NULL, 0, NULL,
+                          0, NULL, 0);
+    ASSERT(rc != 0);
+
+    ASSERT_EQ(count_temp_outputs_for(path), 0);
+    ASSERT(fixture_file_equals(wal, "live-wal"));
+    ASSERT(fixture_file_equals(shm, "live-shm"));
+
+    cbm_unlink(wal);
+    cbm_unlink(shm);
+    cbm_rmdir(path);
+    PASS();
+}
+
+TEST(sw_publish_supports_non_ascii_path) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/tmp/cbm_sw_utf8_XXXXXX");
+    ASSERT(cbm_mkdtemp(dir) != NULL);
+
+    char path[320];
+    char wal[384];
+    char shm[384];
+    snprintf(path, sizeof(path), "%s/db-\xC3\xBC.sqlite", dir);
+    snprintf(wal, sizeof(wal), "%s-wal", path);
+    snprintf(shm, sizeof(shm), "%s-shm", path);
+    ASSERT_EQ(write_fixture_file(wal, "stale-wal"), 0);
+    ASSERT_EQ(write_fixture_file(shm, "stale-shm"), 0);
+
+    int rc = cbm_write_db(path, "test", "/tmp/test", "2026-07-07T00:00:00Z", NULL, 0, NULL, 0, NULL,
+                          0, NULL, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT(!fixture_file_equals(wal, "stale-wal"));
+    ASSERT(!fixture_file_equals(shm, "stale-shm"));
+
+    sqlite3 *db = NULL;
+    rc = sqlite3_open(path, &db);
+    ASSERT_EQ(rc, SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &stmt, NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "ok");
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    cbm_unlink(path);
+    cbm_rmdir(dir);
+    PASS();
+}
+
+TEST(sw_publish_preserves_live_reader) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX open-reader rename semantics");
+#endif
+    char path[256];
+    ASSERT_EQ(make_temp_db(path, sizeof(path)), 0);
+
+    CBMDumpNode old_nodes[1] = {{
+        .id = 1,
+        .project = "test",
+        .label = "Function",
+        .name = "old_fn",
+        .qualified_name = "test.old_fn",
+        .file_path = "old.go",
+        .start_line = 1,
+        .end_line = 2,
+        .properties = "{}",
+    }};
+    int rc = cbm_write_db(path, "test", "/tmp/test", "2026-07-07T00:00:00Z", old_nodes, 1, NULL, 0,
+                          NULL, 0, NULL, 0);
+    ASSERT_EQ(rc, 0);
+
+    sqlite3 *reader = NULL;
+    rc = sqlite3_open(path, &reader);
+    ASSERT_EQ(rc, SQLITE_OK);
+    rc = sqlite3_exec(reader, "PRAGMA mmap_size=268435456", NULL, NULL, NULL);
+    ASSERT_EQ(rc, SQLITE_OK);
+    rc = sqlite3_exec(reader, "BEGIN", NULL, NULL, NULL);
+    ASSERT_EQ(rc, SQLITE_OK);
+    ASSERT_EQ(assert_node_name(reader, "old_fn"), 0);
+
+    CBMDumpNode new_nodes[1] = {{
+        .id = 1,
+        .project = "test",
+        .label = "Function",
+        .name = "new_fn",
+        .qualified_name = "test.new_fn",
+        .file_path = "new.go",
+        .start_line = 1,
+        .end_line = 2,
+        .properties = "{}",
+    }};
+    rc = cbm_write_db(path, "test", "/tmp/test", "2026-07-07T00:00:01Z", new_nodes, 1, NULL, 0,
+                      NULL, 0, NULL, 0);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_EQ(assert_node_name(reader, "old_fn"), 0);
+    rc = sqlite3_exec(reader, "COMMIT", NULL, NULL, NULL);
+    ASSERT_EQ(rc, SQLITE_OK);
+    sqlite3_close(reader);
+
+    sqlite3 *db = NULL;
+    rc = sqlite3_open(path, &db);
+    ASSERT_EQ(rc, SQLITE_OK);
+    ASSERT_EQ(assert_node_name(db, "new_fn"), 0);
+    sqlite3_close(db);
+
+    cbm_unlink(path);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
+
+TEST(sw_page_offsets_do_not_wrap_past_4gib) {
+    /* A 32-bit long offset wraps negative at 2 GiB and back to 0 at 4 GiB: on
+     * Windows a staging DB stopped at exactly 4 GiB with its first pages
+     * overwritten, and publish failed with persist_failed (#2399). */
+    ASSERT_EQ(cbm_writer_page_offset(1), 0);
+    ASSERT_EQ(cbm_writer_page_offset(2), 65536);
+    ASSERT_EQ(cbm_writer_page_offset(32769), INT64_C(2147483648));
+    ASSERT_EQ(cbm_writer_page_offset(65537), INT64_C(4294967296));
+    ASSERT_EQ(cbm_writer_page_offset(UINT32_MAX), (int64_t)(UINT32_MAX - 1) * 65536);
+    PASS();
+}
+
+TEST(sw_open_truncated_path_names_its_reason) {
+    /* final_path is a fixed 4K buffer and make_writer_temp_path only fails by
+     * truncation. Neither sets an errno of its own, so without naming one the
+     * caller reports whatever was left behind by an unrelated call. */
+    char longpath[5000];
+    memset(longpath, 'a', sizeof(longpath) - 1);
+    longpath[sizeof(longpath) - 1] = '\0';
+    longpath[0] = '/';
+
+    errno = 0;
+    cbm_db_writer_t *w = cbm_writer_open(longpath);
+    ASSERT(w == NULL);
+    ASSERT_EQ(errno, ENAMETOOLONG);
+    PASS();
+}
+
+TEST(sw_publish_failure_reports_the_rename_not_the_cleanup) {
+#ifdef _WIN32
+    SKIP_PLATFORM("removing a still-open file to make the cleanup unlink fail");
+#endif
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/tmp/cbm_sw_cleanup_XXXXXX");
+    ASSERT(cbm_mkdtemp(dir) != NULL);
+
+    char final_path[320];
+    snprintf(final_path, sizeof(final_path), "%s/db.sqlite", dir);
+    ASSERT_EQ(write_fixture_file(final_path, "destination"), 0);
+
+    cbm_db_writer_t *w = cbm_writer_open(final_path);
+    ASSERT(w != NULL);
+
+    /* Turn the still-open temp into a directory. The publish rename then fails
+     * with ENOTDIR (directory onto a file), and the cleanup unlink fails too
+     * (EISDIR on Linux, EPERM on macOS) — so only a saved errno still carries
+     * the rename's reason out to the caller. */
+    char temp[512];
+    ASSERT_EQ(find_temp_output_for(final_path, temp, sizeof(temp)), 0);
+    ASSERT_EQ(cbm_unlink(temp), 0);
+    ASSERT(cbm_mkdir_p(temp, 0700));
+
+    errno = 0;
+    int rc = cbm_writer_finalize(w, "test", "/tmp/test", "2026-07-07T00:00:00Z", NULL, 0, NULL, 0,
+                                 NULL, 0, NULL, 0);
+    int publish_errno = errno;
+    ASSERT(rc != 0);
+    ASSERT_EQ(publish_errno, ENOTDIR);
+    /* The destination is intact: a failed publish never replaces it. */
+    ASSERT(fixture_file_equals(final_path, "destination"));
+
+    cbm_rmdir(temp);
+    cbm_unlink(final_path);
+    cbm_rmdir(dir);
+    PASS();
+}
 
 SUITE(sqlite_writer) {
     RUN_TEST(sw_minimal_data);
@@ -614,5 +1070,14 @@ SUITE(sqlite_writer) {
     RUN_TEST(sw_long_index_keys_overflow);
     RUN_TEST(sw_empty);
     RUN_TEST(sw_multi_page);
+    RUN_TEST(sw_interior_level_never_ends_with_empty_page);
     RUN_TEST(sw_oversized_node);
+    RUN_TEST(sw_stream_open_does_not_truncate_destination);
+    RUN_TEST(sw_publish_removes_destination_sidecars);
+    RUN_TEST(sw_publish_failure_preserves_destination_sidecars);
+    RUN_TEST(sw_publish_supports_non_ascii_path);
+    RUN_TEST(sw_publish_preserves_live_reader);
+    RUN_TEST(sw_page_offsets_do_not_wrap_past_4gib);
+    RUN_TEST(sw_open_truncated_path_names_its_reason);
+    RUN_TEST(sw_publish_failure_reports_the_rename_not_the_cleanup);
 }

@@ -37,43 +37,43 @@ while IFS= read -r file; do
     relfile="${file#"$ROOT/"}"
 
     for func in $FUNC_LIST; do
-        # Build precise grep pattern to avoid substring matches:
-        # 'popen(' must NOT match 'cbm_popen(' — use [^a-z] negative class
+        # Match complete C identifiers, including calls at column one and
+        # whitespace before '('. Git wrappers use the existing cbm_popen key;
+        # neither wrapper family may be mistaken for raw popen.
         case "$func" in
-            cbm_popen) pattern="cbm_popen(" ;;
-            popen)     pattern="[^a-z]popen(" ;;
-            system)    pattern="[^a-z_]system(" ;;
-            fork)      pattern="[^a-z_]fork(" ;;
-            *)         pattern="[^a-z_]${func}(" ;;
+            cbm_popen) pattern='(^|[^[:alnum:]_])cbm_popen(_git)?[[:space:]]*\(' ;;
+            *)         pattern="(^|[^[:alnum:]_])${func}[[:space:]]*\\(" ;;
         esac
 
         # Grep for pattern, excluding comments and #define lines
-        if grep -n "$pattern" "$file" 2>/dev/null | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v '#define' > /dev/null 2>&1; then
+        if grep -nE "$pattern" "$file" 2>/dev/null | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v '#define' > /dev/null 2>&1; then
             if ! grep -q "^${relfile}:${func}:" "$ALLOWLIST" 2>/dev/null; then
                 echo "BLOCKED: ${relfile}: contains ${func}() — not on allow-list"
-                grep -n "$pattern" "$file" 2>/dev/null | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v '#define' | head -3 | sed 's/^/  /'
+                grep -nE "$pattern" "$file" 2>/dev/null | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v '#define' | head -3 | sed 's/^/  /'
                 fail
             fi
         fi
     done
 done < <(find "$ROOT/src" -name '*.c' -type f | sort)
 
-# ── 1b. Raw network calls (must not exist) ──────────────────────
+# ── 1b. Raw network calls (count-bounded explicit exceptions) ───
 #
 # The graph-UI HTTP server (src/ui/httpd.c) is the one component that owns a
 # listening socket. It is first-party, binds 127.0.0.1 only, and is audited
 # separately by scripts/security-ui.sh (binding + CORS checks), so it is
-# exempt from this scan. No other source file may make raw network calls.
+# exempt from this scan. Coordination and authenticated UI readiness may use
+# only explicitly count-bounded, helper-scoped AF_UNIX or loopback-v4 calls.
 
 echo ""
-echo "--- Scanning for raw network calls (must not exist) ---"
+echo "--- Scanning for raw network calls ---"
 
-NETWORK_FUNCS='[^a-z_]connect\(|[^a-z_]socket\(|[^a-z_]sendto\('
-if grep -rn -E "$NETWORK_FUNCS" "$ROOT/src/" --include='*.c' 2>/dev/null | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v 'test' | grep -v 'src/ui/httpd.c'; then
-    echo "BLOCKED: Raw network calls found in src/."
+NETWORK_OK=true
+if ! python3 "$ROOT/scripts/security-network-source-audit.py" "$ROOT" "$ALLOWLIST"; then
     fail
-else
-    echo "OK: No raw network calls outside the graph-UI server."
+    NETWORK_OK=false
+fi
+if $NETWORK_OK; then
+    echo "OK: Raw network calls are absent or explicitly count-bounded."
 fi
 
 # ── 2. Hardcoded URLs in string literals ─────────────────────────
@@ -170,20 +170,32 @@ echo ""
 echo "--- Scanning for unexpected file writes in src/ ---"
 
 FOPEN_FOUND=false
-while IFS= read -r match; do
-    [[ -z "$match" ]] && continue
-    file=$(echo "$match" | cut -d: -f1)
+while IFS= read -r file; do
     relfile="${file#"$ROOT/"}"
+    matches=$(grep -n 'fopen.*"w' "$file" 2>/dev/null \
+        | grep -v '^\s*//' || true)
+    [[ -z "$matches" ]] && continue
     case "$relfile" in
         src/cli/cli.c|src/store/store.c|src/pipeline/*.c|src/foundation/log.c|src/foundation/diagnostics.c|src/ui/http_server.c|src/ui/config.c|src/mcp/mcp.c)
             ;; # Known safe (diagnostics.c: atomic .tmp+rename metrics dump to configured path)
         *)
-            echo "REVIEW: ${match}"
-            echo "  -> Unexpected fopen(\"w\") in ${relfile}"
-            FOPEN_FOUND=true
+            actual_count=$(printf '%s\n' "$matches" | wc -l | tr -d ' ')
+            allowance=$(grep -E "^WRITE:${relfile}:[0-9]+:" \
+                "$ALLOWLIST" 2>/dev/null || true)
+            allowance_count=$(printf '%s\n' "$allowance" | grep -c . || true)
+            expected_count=$(printf '%s\n' "$allowance" | cut -d: -f3)
+            if [[ "$allowance_count" != "1" ||
+                  "$actual_count" != "$expected_count" ]]; then
+                echo "REVIEW: ${relfile}: unexpected fopen(\"w\") surface"
+                echo "  expected=${expected_count:-none} actual=${actual_count}"
+                printf '%s\n' "$matches" | sed 's/^/  /'
+                FOPEN_FOUND=true
+            else
+                echo "REVIEWED: ${relfile}: ${actual_count} count-bounded file write(s)"
+            fi
             ;;
     esac
-done < <(grep -rn 'fopen.*"w' "$ROOT/src/" --include='*.c' 2>/dev/null | grep -v '/test' | grep -v '^\s*//' || true)
+done < <(find "$ROOT/src" -name '*.c' -type f | sort)
 
 if ! $FOPEN_FOUND; then
     echo "OK: All file writes are in expected locations."
@@ -201,7 +213,7 @@ while IFS= read -r file; do
     relfile="${file#"$ROOT/"}"
 
     # Extract line numbers of dangerous calls
-    DANGER_LINES=$(grep -n 'system(\|popen(\|cbm_popen(\|connect(\|execl(' "$file" 2>/dev/null \
+    DANGER_LINES=$(grep -nE '(^|[^[:alnum:]_])(system|popen|cbm_popen(_git)?|connect|execl)[[:space:]]*\(' "$file" 2>/dev/null \
         | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v '#define' \
         | cut -d: -f1 || true)
 
@@ -247,10 +259,12 @@ if [ -f "$MCP_FILE" ]; then
     # - HTTP transport: reads the incoming request body (content-length bound)
     # Count fopen/fread calls and compare against expected
     FOPEN_COUNT=$(grep -c 'fopen\|fread\|read_file' "$MCP_FILE" 2>/dev/null || echo "0")
-    # Update this when legitimate reads are added. 13 reads audited as of the
-    # search/ADR/Windows-support commits — all path-contained or transport
-    # reads, no new exfiltration surface.
-    EXPECTED_MAX=13
+    # Current main inventory: 26 matching source lines (previous 15 + 14 added
+    # - 3 removed). Reviewed additions: 3 comments, 1 bounded grep-output read,
+    # 1 path-contained Git first-line read, 3 changed-file hash branches, and
+    # 6 revision/merge-base/path/status/hunk reads. This lexical count remains
+    # a growth tripwire: newly matching lines require review before raising it.
+    EXPECTED_MAX=26
     if [ "$FOPEN_COUNT" -gt "$EXPECTED_MAX" ]; then
         echo "REVIEW: src/mcp/mcp.c has $FOPEN_COUNT file read operations (expected max $EXPECTED_MAX)"
         echo "  New file reads in MCP tool handlers must be reviewed for data exfiltration risk."

@@ -14,14 +14,15 @@
  *      tree-sitter scanners that infinite-loop (a hang, not a crash).
  *
  * The reap loop is EINTR-safe. Line tailing keeps a partial final line buffered
- * (an incomplete, un-newline-terminated line is not yet "progress" and is not
- * mis-read as a completed marker).
+ * while the child tree can still write, then delivers that final fragment once
+ * the tree is quiescent.
  */
 #ifndef CBM_SUBPROCESS_H
 #define CBM_SUBPROCESS_H
 
 #include <stdbool.h>
 #include <stddef.h> /* size_t (cbm_build_win_cmdline) */
+#include <stdint.h>
 
 /* How a supervised child ended. */
 typedef enum {
@@ -36,29 +37,154 @@ typedef enum {
 
 typedef struct {
     cbm_proc_outcome_t outcome;
-    int exit_code;   /* WEXITSTATUS / GetExitCodeProcess; -1 when terminated by a POSIX signal */
-    int term_signal; /* WTERMSIG on POSIX; 0 otherwise */
+    int exit_code;               /* WEXITSTATUS / GetExitCodeProcess; -1 for a POSIX signal */
+    int term_signal;             /* WTERMSIG on POSIX; 0 otherwise */
+    bool cancellation_requested; /* an explicit cancel request was accepted before terminal */
+    bool forced; /* force was needed after grace expiry or to reap descendants after root exit */
+    bool tree_quiesced;      /* the owned process tree has no surviving processes */
+    bool supervision_failed; /* the bounded containment deadline expired; tree_quiesced is false */
+    size_t job_memory_limit_bytes; /* Windows Job Object commit cap; zero on POSIX or uncapped */
+    size_t peak_job_memory_bytes;  /* Windows peak commit, not RSS or proof of a limit hit */
+    bool job_memory_available;     /* terminal Job Object memory query succeeded */
 } cbm_proc_result_t;
 
-/* Called for each newly-completed (newline-terminated) log line while the child
- * runs. A completed line also resets the quiet-timeout (it is progress). */
+/* Called synchronously for each newly-completed log chunk while the child runs.
+ * Newline-terminated lines are delivered without their newline; oversized lines
+ * may be split into 1023-byte chunks, and the final unterminated remainder is
+ * delivered after the tree is quiescent. Each delivered chunk resets the quiet
+ * timeout. Poll bounds callback work by chunk/byte count, not elapsed time, so
+ * callbacks must return promptly. */
 typedef void (*cbm_proc_log_cb)(const char *line, void *ud);
 
 typedef struct {
-    const char *bin;             /* executable path; also argv[0] when argv is NULL */
-    const char *const *argv;     /* NULL-terminated argv; NULL => { bin, NULL } */
-    const char *log_file;        /* child stdout+stderr are redirected here and tailed;
-                                  * NULL => discard child output, no tailing */
-    cbm_proc_log_cb on_log_line; /* optional per-line callback */
-    void *log_ud;                /* user data for on_log_line */
-    int quiet_timeout_ms;        /* <= 0 => no timeout; else kill+HANG after this many
-                                  * ms with no new completed log line */
-    bool delete_log_on_exit;     /* unlink log_file after reaping */
+    const char *bin;                  /* executable path or literal PATH name;
+                                       * also argv[0] when argv is NULL */
+    const char *const *argv;          /* NULL-terminated argv; NULL => { bin, NULL } */
+    const char *const *env_overrides; /* NULL-terminated NAME=value entries, merged with the
+                                       * inherited environment for this child only. NAME= keeps
+                                       * an empty value; the last duplicate wins. Names must be
+                                       * nonempty (case-insensitive on Windows). NULL or an empty
+                                       * list preserves normal inheritance. Executable lookup
+                                       * continues to use the caller's PATH. strip_git_repo_env
+                                       * also removes repository-local entries and GIT_DIFF_OPTS
+                                       * from overrides. */
+    const char *windows_cmd_payload;  /* Windows-only cmd.exe command text. When set, bin must
+                                       * be an absolute path ending in cmd.exe and argv must be
+                                       * NULL. The fixed /D /S /V:OFF /C prefix is added while
+                                       * this payload is copied verbatim for cmd.exe to parse. */
+    const char *log_file;             /* stderr and, when stdout_file is NULL, stdout are
+                                       * redirected here and tailed; NULL => discard those
+                                       * streams, no tailing */
+    cbm_proc_log_cb on_log_line;      /* optional per-line callback */
+    void *log_ud;                     /* user data for on_log_line */
+    int quiet_timeout_ms;             /* <= 0 => no timeout; else kill+HANG after this many
+                                       * ms with no new completed log line */
+    int cancel_grace_ms;              /* graceful tree-termination window; <= 0 uses the finite
+                                       * CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS */
+    size_t memory_limit_bytes;        /* Windows-only hard commit limit for the entire Job Object;
+                                       * 0 => no OS-enforced memory limit */
+    bool delete_log_on_exit;          /* unlink log_file after reaping */
+    bool strip_git_repo_env;          /* child env omits git's repository-local variables
+                                       * (foundation/git_env.h) — set for every git spawn so
+                                       * an inherited GIT_DIR never overrides `git -C` */
+    const char *stdout_file;          /* optional separate stdout capture; NULL preserves
+                                       * merged log_file behavior. Must be nonempty and
+                                       * distinct from log_file; caller supplies private,
+                                       * non-aliasing paths and owns capture-file cleanup.
+                                       * Not tailed; quiet_timeout_ms observes log_file only.
+                                       * delete_log_on_exit never deletes this file. */
+    const char *stdin_file;           /* optional private, immutable regular binary input;
+                                       * NULL => null device, never inherited stdin.
+                                       * Must be nonempty and non-aliasing with log_file and
+                                       * stdout_file; exact equal strings are rejected.
+                                       * Caller closes its writer before spawn and retains
+                                       * the file until the child tree is quiescent.
+                                       * The child chooses its CRT binary mode on Windows.
+                                       * Never modified or deleted by this API. */
 } cbm_proc_opts_t;
 
+#define CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS 1000
+#define CBM_SUBPROCESS_MAX_CANCEL_GRACE_MS 1000
+#define CBM_SUBPROCESS_FORCE_SETTLE_MS 1000
+
+/* Opaque, owned supervisor for one child and its contained descendant tree.
+ * POSIX implementations contain the child in its own process group; Windows
+ * implementations use a Job Object. The containment is what makes a terminal
+ * result stronger than merely observing that the direct child exited. */
+typedef struct cbm_subprocess cbm_subprocess_t;
+
+typedef enum {
+    CBM_PROC_POLL_ERROR = -1, /* invalid handle/arguments */
+    CBM_PROC_POLL_RUNNING = 0,
+    CBM_PROC_POLL_TERMINAL = 1
+} cbm_proc_poll_t;
+
+typedef enum {
+    CBM_PROC_TREE_RSS_ERROR = -1,
+    CBM_PROC_TREE_RSS_EMPTY = 0,
+    CBM_PROC_TREE_RSS_OK = 1,
+} cbm_proc_tree_rss_status_t;
+
+/* Spawn opts->bin and return immediately with a supervisor handle. On success,
+ * *out owns the process until a terminal poll followed by destroy. Spawn copies
+ * the option strings/argv it needs after return; log_ud remains caller-owned until
+ * terminal. Returns 0 on success or -1 on validation/spawn failure (*out == NULL).
+ *
+ * A quiet timeout begins at successful spawn and is reset by each completed log
+ * line. Expiry starts the same graceful->forced tree shutdown as explicit cancel,
+ * but the terminal outcome remains CBM_PROC_HANG. */
+int cbm_subprocess_spawn(const cbm_proc_opts_t *opts, cbm_subprocess_t **out);
+
+/* Advance supervision without sleeping or waiting for the child. RUNNING means
+ * the caller must poll again. TERMINAL is returned only after the direct child is
+ * reaped AND the entire owned process tree is quiescent; *out is then filled with
+ * the cached immutable result. Every later poll returns TERMINAL with that same
+ * result. If an OS containment operation remains failed through the bounded
+ * force-settle deadline, TERMINAL is still returned but supervision_failed is
+ * true and tree_quiesced is false; callers must log this as a critical teardown
+ * failure. *out is optional and is not modified for RUNNING or ERROR.
+ *
+ * Each poll delivers at most 64 log chunks / 64 KiB. On the normal callback
+ * delivery path, RUNNING may continue after the process tree is quiescent while
+ * remaining log batches drain, and TERMINAL follows successful catch-up. A
+ * final-drain I/O error instead terminates without changing process-tree
+ * classification and does not attempt to delete the log.
+ *
+ * Poll performs the graceful->force state transition: after explicit cancel (or
+ * quiet-timeout), it requests graceful termination once, then force-terminates the
+ * tree when cancel_grace_ms elapses. Callers must keep polling to make progress. */
+cbm_proc_poll_t cbm_subprocess_poll(cbm_subprocess_t *process, cbm_proc_result_t *out);
+
+/* Read the current charged memory of the complete contained process tree.
+ * On macOS this is phys_footprint (what the OS holds against the process);
+ * elsewhere it is RSS. OK returns an overflow-safe byte total, EMPTY means
+ * the owned tree currently has no observable members, and ERROR means no
+ * trustworthy measurement could be obtained. A member that exits between the
+ * listing and its measurement is ignored (the platform reports it gone); any
+ * other member that cannot be measured is ERROR, never a smaller total. */
+cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_bytes(cbm_subprocess_t *process,
+                                                         uint64_t *rss_bytes);
+bool cbm_subprocess_root_running(const cbm_subprocess_t *process);
+bool cbm_subprocess_termination_pending(const cbm_subprocess_t *process);
+bool cbm_subprocess_supervision_active(const cbm_subprocess_t *process);
+
+/* Record an explicit cancellation request without waiting. Safe to repeat and
+ * safe to call from a cancellation thread while one owner thread polls. The
+ * owner must stop cancellation producers before destroying the handle. true
+ * means the process tree is live and cancellation is now/already pending; false
+ * means process is NULL, draining terminal logs, or already terminal. Poll
+ * performs signal delivery/escalation. */
+bool cbm_subprocess_request_cancel(cbm_subprocess_t *process);
+
+/* Release a terminal handle. This never waits or implicitly cancels; passing a
+ * still-running handle violates the API contract. NULL is a no-op. */
+void cbm_subprocess_destroy(cbm_subprocess_t *process);
+
 /* Spawn opts->bin, supervise (tail + optional quiet-timeout), block until it ends,
- * and classify the result into *out. Returns 0 if a child was spawned and reaped
- * (out filled), or -1 if the spawn itself failed (out->outcome == CBM_PROC_SPAWN_FAILED). */
+ * and classify the result into *out. Compatibility wrapper around spawn + repeated
+ * poll + bounded sleeps. Returns 0 if a child was spawned and its tree reached
+ * terminal (out filled), or -1 if spawning/supervision failed
+ * (out->outcome == CBM_PROC_SPAWN_FAILED). */
 int cbm_subprocess_run(const cbm_proc_opts_t *opts, cbm_proc_result_t *out);
 
 /* Pure outcome classifier — exposed so the platform-specific exit-code mapping
@@ -87,5 +213,58 @@ const char *cbm_proc_outcome_str(cbm_proc_outcome_t o);
  * is unit-tested on Linux/macOS CI, and so both spawn sites (cbm_subprocess_run and
  * the UI http_server index spawn) escape through one shared, tested implementation. */
 bool cbm_build_win_cmdline(char *buf, size_t cap, const char *const *argv);
+
+/* Build the special CreateProcess command line needed to invoke cmd.exe with a
+ * command-language payload. Unlike cbm_build_win_cmdline(), payload is not a C
+ * runtime argv element: cmd.exe must receive its embedded quotes and backslashes
+ * unchanged. cmd_executable must be an absolute Windows path whose basename is
+ * cmd.exe. The result is:
+ *
+ *   "<absolute-cmd.exe>" /D /S /V:OFF /C <payload-verbatim>
+ *
+ * Returns false for invalid input or overflow and leaves a valid empty string
+ * whenever buf/cap permit one. Pure string logic, available on every platform
+ * so the Windows serialization contract is unit-testable everywhere. */
+bool cbm_build_win_cmd_payload(char *buf, size_t cap, const char *cmd_executable,
+                               const char *payload);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Force the next N spawn attempts to behave as if the kernel returned EAGAIN
+ * ("try again"), so the retry path can be exercised deterministically instead
+ * of hoping a loaded machine reproduces it. Test builds only. */
+void cbm_subprocess_force_spawn_eagain_for_testing(int attempts);
+int cbm_subprocess_pending_spawn_eagain_for_testing(void);
+/* Hold the parent of the next N POSIX spawns until the child has exited (left
+ * unreaped) before it checks the child's process group: the order a loaded
+ * machine produces when a short command finishes before the parent runs
+ * again. Test builds only. */
+void cbm_subprocess_hold_parent_until_child_exits_for_testing(int spawns);
+/* For the next N POSIX spawns, the parent's group check observes what macOS
+ * shows for a child that is EXITING: setpgid and getpgid answer ESRCH while
+ * waitid does not report it yet. Test builds only. */
+void cbm_subprocess_observe_exiting_child_for_testing(int spawns);
+uint64_t cbm_subprocess_rss_sum_for_testing(const uint64_t *values, size_t count);
+/* Make the tree probe's measurement of every NON-root member fail with
+ * platform_error (errno on POSIX, GetLastError() on Windows), as a live or an
+ * exiting member would; 0 restores the real calls. Test builds only. */
+void cbm_subprocess_tree_rss_fault_members_for_testing(int platform_error);
+#endif
+
+/* How the POSIX fork+exec child closed its inherited descriptors (#1484). */
+typedef enum {
+    CBM_FD_CLOSE_RANGE = 1, /* Linux close_range(2): one syscall */
+    CBM_FD_CLOSEFROM,       /* BSD closefrom(3): one call */
+    CBM_FD_CLOSE_LOOP       /* close() per descriptor up to _SC_OPEN_MAX: O(RLIMIT_NOFILE) */
+} cbm_fd_close_strategy_t;
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && !defined(_WIN32)
+/* Run the child's close-inherited-descriptors step in the CALLING process for
+ * descriptors >= lowfd (callers pick a lowfd above everything they need) and
+ * report which strategy did the work. Test builds only. */
+cbm_fd_close_strategy_t cbm_subprocess_close_fds_from_for_testing(int lowfd, long max_fd);
+/* Make the close_range fast path behave as if the kernel lacked it (ENOSYS),
+ * so the fallback loop is exercised deterministically. Test builds only. */
+void cbm_subprocess_force_close_range_enosys_for_testing(bool force);
+#endif
 
 #endif /* CBM_SUBPROCESS_H */

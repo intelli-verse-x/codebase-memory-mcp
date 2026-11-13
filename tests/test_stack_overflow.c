@@ -11,10 +11,13 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "lang_specs.h" /* cbm_ts_language — direct-parse GLR cap regression (#913) */
+#include "lsp/ts_lsp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 
 /* tree-sitter runtime allocator hooks (ts_runtime/src/alloc.h, TS_PUBLIC) and
  * mimalloc (vendored) — for the #424 allocator-binding regression test. */
@@ -397,11 +400,11 @@ TEST(cpp_large_templated_header_no_crash_issue424) {
  * java_resolve_calls_in_node frames (bind_lambda_args), bitcoin → SIGSEGV
  * under deep c_resolve_calls_in_node frames (cbm_type_substitute via
  * c_adl_resolve), microsoft/TypeScript → SIGBUS under an unbounded
- * lookup_member_type cycle. The walks now carry depth guards; these
- * reproductions fork a child so a regression cannot kill the test runner
- * (the TS cyclic-type shape is only reachable with a real cross-file
- * registry, so that one is verified at the real-repo tier; the synthetic
- * cyclic fixture here guards the in-file path).
+ * lookup_member_type cycle. The walks now carry depth guards. Non-TS crash
+ * fixtures fork on POSIX and run in-process on Windows. TypeScript cycle work
+ * runs in-process on both platforms to assert test-only lookup counters.
+ * The synthetic single-file fixtures here guard the local inheritance path;
+ * real-repo scale extraction is checked separately.
  * ═══════════════════════════════════════════════════════════════════ */
 
 #if !defined(_WIN32)
@@ -431,6 +434,77 @@ static bool so_extract_crashes(const char *content, CBMLanguage lang, const char
             cbm_extract_file(content, (int)strlen(content), lang, "so", relpath, 0, NULL, NULL);
         if (r) {
             cbm_free_result(r);
+        }
+        _exit(0);
+    }
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    return WIFSIGNALED(status);
+#endif
+}
+
+#if !defined(_WIN32)
+/* Child-side alarm handler: a clean exit on the deadline — never reached on
+ * a crash (SIGSEGV/SIGBUS terminate the child first and stay visible). */
+static void so_parse_alarm_exit(int sig) {
+    (void)sig;
+    _exit(0);
+}
+
+#endif
+
+/* Parse `content` with tree-sitter DIRECTLY in a forked child — bypassing
+ * cbm_extract_file's Perl pre-parse nesting guard — returning true if the child
+ * died by signal. This is the crash-isolating regression for the vendored GLR
+ * stack-merge recursion cap (CBM_TS_STACK_MERGE_MAX_DEPTH, ts_runtime/src/stack.c):
+ * the extract-level guard skips pathologically nested Perl before it reaches the
+ * parser, so only a direct parse exercises the cap. Windows runs in-process (a
+ * real crash aborts the runner — a visible failure), mirroring so_extract_crashes. */
+static bool so_parse_crashes(const char *content, CBMLanguage lang) {
+    const TSLanguage *ts_lang = cbm_ts_language(lang);
+    if (!ts_lang) {
+        return false;
+    }
+#if defined(_WIN32)
+    TSParser *parser = ts_parser_new();
+    if (parser) {
+        ts_parser_set_language(parser, ts_lang);
+        TSTree *tree = ts_parser_parse_string(parser, NULL, content, (uint32_t)strlen(content));
+        if (tree) {
+            ts_tree_delete(tree);
+        }
+        ts_parser_delete(parser);
+    }
+    return false;
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) {
+        return false;
+    }
+    if (pid == 0) {
+        /* Deterministic ceiling. Falsification data (2026-07-18, macOS
+         * ASan): with CBM_TS_STACK_MERGE_MAX_DEPTH deleted outright, this
+         * branch stayed GREEN both unbounded (220s full grind, no crash)
+         * and bounded — instrumentation shows the recursive merge path is
+         * never even entered here (max depth 0 through the whole window).
+         * The cap-regression DETECTION therefore lives in the Windows
+         * in-process branch above (real ~1 MB native stack, where #913
+         * manifested); this POSIX branch is a bounded no-crash smoke of
+         * the pathological parse, and grinding past 10s adds no signal
+         * (unbounded it wandered 2s-218s with machine state). A real
+         * SIGSEGV/SIGBUS still terminates the child by signal before the
+         * alarm handler can exit cleanly. */
+        signal(SIGALRM, so_parse_alarm_exit);
+        alarm(10);
+        TSParser *parser = ts_parser_new();
+        if (parser) {
+            ts_parser_set_language(parser, ts_lang);
+            TSTree *tree = ts_parser_parse_string(parser, NULL, content, (uint32_t)strlen(content));
+            if (tree) {
+                ts_tree_delete(tree);
+            }
+            ts_parser_delete(parser);
         }
         _exit(0);
     }
@@ -512,6 +586,68 @@ TEST(lsp_python_deep_expression_no_crash) {
     PASS();
 }
 
+TEST(lsp_perl_deep_expression_no_crash) {
+    /* Deeply nested Perl call expressions f(f(f(...f(1)...))). Unlike the
+     * Java/C++ cases, the overflow here is NOT in the LSP walk — it is in
+     * tree-sitter's own GLR parser: stack_node_add_link (vendored
+     * ts_runtime/src/stack.c) recurses once per nesting level while merging the
+     * ambiguous parse-stack heads that Perl's `f(...)` grammar produces, blowing
+     * a small (1 MB Windows) stack during the parse, before any LSP walk runs.
+     * The CBM_PERL_MAX_PARSE_NESTING pre-parse guard in cbm_extract_file skips
+     * such input so it never reaches tree-sitter. See
+     * lsp_java_deep_nesting_no_crash on the depth choice. */
+    const int DEPTH = 30000;
+    size_t sz = (size_t)DEPTH * 3 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "sub f { return $_[0]; }\nsub g { return ");
+    for (int i = 0; i < DEPTH; i++) {
+        *p++ = 'f';
+        *p++ = '(';
+    }
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), "; }\n");
+    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_PERL, "deep.pl"));
+    free(src);
+    PASS();
+}
+
+TEST(perl_glr_deep_parse_recursion_capped) {
+    /* Issue #913 — the proper fix for what lsp_perl_deep_expression_no_crash's
+     * pre-parse guard only works around. Parse deeply nested ambiguous Perl
+     * f(f(f(...f(1)...))) DIRECTLY (past the CBM_PERL_MAX_PARSE_NESTING guard,
+     * which would otherwise skip it). Perl's paren-optional call grammar makes
+     * each level ambiguous, so tree-sitter's GLR parser merges the ambiguous
+     * parse-stack heads recursively — stack_node_add_link in
+     * ts_runtime/src/stack.c, once per nesting level — overflowing the native
+     * stack (a ~1 MB Windows stack, and even an 8 MB POSIX stack at this depth)
+     * during the parse, before any extraction runs. The
+     * CBM_TS_STACK_MERGE_MAX_DEPTH cap stops merging past the bound: the
+     * ambiguity is left on the GLR stack instead of merged — a valid parse,
+     * never a wrong one — so the parse returns cleanly instead of crashing.
+     * Depth mirrors lsp_perl_deep_expression_no_crash. */
+    const int DEPTH = 30000;
+    size_t sz = (size_t)DEPTH * 3 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "sub f { return $_[0]; }\nsub g { return ");
+    for (int i = 0; i < DEPTH; i++) {
+        *p++ = 'f';
+        *p++ = '(';
+    }
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), "; }\n");
+    ASSERT_FALSE(so_parse_crashes(src, CBM_LANG_PERL));
+    free(src);
+    PASS();
+}
+
 TEST(lsp_java_lambda_args_exceed_params_no_crash) {
     /* A call with MORE arguments than the resolved method's declared params:
      * bind_lambda_args indexed the NULL-terminated signature param_types array
@@ -535,9 +671,106 @@ TEST(lsp_ts_cyclic_types_no_crash) {
                       "interface D extends C { d: number; }\n"
                       "declare const a: A;\n"
                       "declare const c: C;\n"
-                      "function useIt(p: C) { return p.missing_member; }\n"
+                      /* Both lookup paths must traverse the inheritance cycle. */
+                      "function useIt(p: C) { p.missing(); return p.missing_member; }\n"
                       "const y = c.also_missing;\n";
-    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_TYPESCRIPT, "cycle.ts"));
+    CBMFileResult *r = extract(src, CBM_LANG_TYPESCRIPT, "test", "cycle.ts");
+    ASSERT_NOT_NULL(r);
+    /* C and D each have one parent: <= 64 admitted visits per type, plus
+     * one attempted (possibly rejected) parent visit per admitted visit. */
+    ASSERT_GT(cbm_ts_lsp_test_max_member_lookup_steps(), 0);
+    ASSERT_GT(cbm_ts_lsp_test_max_method_lookup_steps(), 0);
+    ASSERT_LTE(cbm_ts_lsp_test_max_member_lookup_steps(), 2 * 64 * 2);
+    ASSERT_LTE(cbm_ts_lsp_test_max_method_lookup_steps(), 2 * 64 * 2);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(lsp_ts_branching_cycle_has_bounded_work) {
+    const char *src =
+        "interface A extends B, C {}\n"
+        "interface B extends A, C {}\n"
+        "interface C extends A, B {}\n"
+        "function useIt(value: A) { value.missing(); return value.missing_member; }\n";
+    CBMFileResult *r = extract(src, CBM_LANG_TYPESCRIPT, "test", "branching-cycle.ts");
+    ASSERT_NOT_NULL(r);
+    /* A, B, C each have two parents: <= 64 admitted visits per type, plus
+     * two attempted (possibly rejected) parent visits per admitted visit. */
+    ASSERT_GT(cbm_ts_lsp_test_max_member_lookup_steps(), 0);
+    ASSERT_GT(cbm_ts_lsp_test_max_method_lookup_steps(), 0);
+    ASSERT_LTE(cbm_ts_lsp_test_max_member_lookup_steps(), 3 * 64 * 3);
+    ASSERT_LTE(cbm_ts_lsp_test_max_method_lookup_steps(), 3 * 64 * 3);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(lsp_ts_shallower_revisit_preserves_inherited_method) {
+    enum { CHAIN = 62, CAP = 16384 };
+    char *src = malloc(CAP);
+    ASSERT_NOT_NULL(src);
+    size_t used =
+        (size_t)snprintf(src, CAP,
+                         "interface Service { ping(): void; }\n"
+                         "interface Target { inherited(): void; inheritedField: Service; }\n"
+                         "interface Shared extends Target {}\n"
+                         "interface Root extends D0, Shared {}\n");
+    for (int i = 0; i < CHAIN; i++) {
+        const char *parent = i + 1 < CHAIN ? "D" : "Shared";
+        int wrote = i + 1 < CHAIN
+                        ? snprintf(src + used, CAP - used, "interface D%d extends %s%d {}\n", i,
+                                   parent, i + 1)
+                        : snprintf(src + used, CAP - used, "interface D%d extends Shared {}\n", i);
+        ASSERT_TRUE(wrote > 0 && (size_t)wrote < CAP - used);
+        used += (size_t)wrote;
+    }
+    int wrote = snprintf(
+        src + used, CAP - used,
+        "function useIt(value: Root) { value.inherited(); value.inheritedField.ping(); }\n");
+    ASSERT_TRUE(wrote > 0 && (size_t)wrote < CAP - used);
+
+    CBMFileResult *r = extract(src, CBM_LANG_TYPESCRIPT, "test", "shallower.ts");
+    free(src);
+    ASSERT_NOT_NULL(r);
+    int inherited_method_found = 0;
+    int inherited_field_method_found = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &r->resolved_calls.items[i];
+        if (resolved->confidence > 0 && resolved->caller_qn &&
+            strstr(resolved->caller_qn, "useIt") && resolved->callee_qn &&
+            strstr(resolved->callee_qn, "inherited")) {
+            inherited_method_found = 1;
+        }
+        if (resolved->confidence > 0 && resolved->caller_qn &&
+            strstr(resolved->caller_qn, "useIt") && resolved->callee_qn &&
+            strstr(resolved->callee_qn, "ping")) {
+            inherited_field_method_found = 1;
+        }
+    }
+    cbm_free_result(r);
+    ASSERT_TRUE(inherited_method_found);
+    ASSERT_TRUE(inherited_field_method_found);
+    PASS();
+}
+
+TEST(lsp_ts_inherited_method_lookup) {
+    const char *src = "interface Base { inherited(): void; }\n"
+                      "interface Child extends Base {}\n"
+                      "function useIt(c: Child) { c.inherited(); }\n";
+    CBMFileResult *r = extract(src, CBM_LANG_TYPESCRIPT, "test", "inherited.ts");
+    ASSERT_NOT_NULL(r);
+
+    int found = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &r->resolved_calls.items[i];
+        if (resolved->confidence > 0 && resolved->caller_qn &&
+            strstr(resolved->caller_qn, "useIt") && resolved->callee_qn &&
+            strstr(resolved->callee_qn, "inherited")) {
+            found = 1;
+            break;
+        }
+    }
+    cbm_free_result(r);
+    ASSERT_TRUE(found);
     PASS();
 }
 
@@ -640,7 +873,11 @@ TEST(lsp_kotlin_deep_nesting_no_crash) {
  * Suite registration
  * ═══════════════════════════════════════════════════════════════════ */
 
-SUITE(stack_overflow) {
+/* Split into three sub-suites so parallel/sharded runs are not serialized
+ * behind one ~4-minute suite (it was the wall-clock critical path: every
+ * other suite finished underneath it). New regressions stay in the matching
+ * shard; the shard runner asserts aggregate test-count parity. */
+SUITE(stack_overflow_a) {
     cbm_init();
 
     RUN_TEST(ts_allocator_bound_to_mimalloc_issue424);
@@ -649,11 +886,29 @@ SUITE(stack_overflow) {
     RUN_TEST(lsp_java_lambda_args_exceed_params_no_crash);
     RUN_TEST(lsp_cpp_deep_expression_no_crash);
     RUN_TEST(lsp_python_deep_expression_no_crash);
+    RUN_TEST(lsp_perl_deep_expression_no_crash);
+
+    cbm_shutdown();
+}
+
+SUITE(stack_overflow_b) {
+    cbm_init();
+
+    RUN_TEST(perl_glr_deep_parse_recursion_capped);
     RUN_TEST(lsp_ts_cyclic_types_no_crash);
+    RUN_TEST(lsp_ts_branching_cycle_has_bounded_work);
+    RUN_TEST(lsp_ts_shallower_revisit_preserves_inherited_method);
+    RUN_TEST(lsp_ts_inherited_method_lookup);
     RUN_TEST(lsp_python_deep_nesting_no_crash);
     RUN_TEST(lsp_go_deep_nesting_no_crash);
     RUN_TEST(lsp_php_deep_nesting_no_crash);
     RUN_TEST(lsp_kotlin_deep_nesting_no_crash);
+
+    cbm_shutdown();
+}
+
+SUITE(stack_overflow_c) {
+    cbm_init();
 
     RUN_TEST(js_calls_exceed_512);
     RUN_TEST(python_calls_exceed_512);

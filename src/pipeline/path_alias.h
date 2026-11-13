@@ -55,6 +55,7 @@ typedef struct {
  * pick up the map of the nearest ancestor scope. */
 typedef struct {
     char *dir_prefix;
+    char *source_rel_path; /* selected config file (tsconfig beats jsconfig) */
     cbm_path_alias_map_t *map;
 } cbm_path_alias_scope_t;
 
@@ -91,5 +92,11 @@ const cbm_path_alias_map_t *cbm_path_alias_find_for_file(const cbm_path_alias_co
  * .jsx) are stripped from the resolved path so the existing module-FQN
  * pipeline can consume it. */
 char *cbm_path_alias_resolve(const cbm_path_alias_map_t *map, const char *module_path);
+
+/* The same, written into out (cap bytes, NUL-terminated) instead of a heap
+ * string; false when no alias applies or the path does not fit. */
+enum { CBM_PATH_ALIAS_RESULT_MAX = 4096 };
+bool cbm_path_alias_resolve_into(const cbm_path_alias_map_t *map, const char *module_path,
+                                 char *out, size_t cap);
 
 #endif /* CBM_PATH_ALIAS_H */

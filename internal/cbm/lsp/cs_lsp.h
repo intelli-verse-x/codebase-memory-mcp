@@ -61,6 +61,11 @@ typedef struct {
     const char *local_name; /* alias name; "" for non-alias */
     const char *target_qn;  /* dotted target QN */
     bool is_global;         /* `global using` */
+    /* Declared inside a namespace body rather than at compilation-unit level.
+     * C# consults a namespace declaration's usings right after that
+     * namespace's own members, but compilation-unit usings only after the
+     * global namespace's members, so the two rank on opposite sides of it. */
+    bool in_namespace;
 } CBMCSUsing;
 
 /* CSLSPContext — per-file type-evaluation state. */
@@ -97,6 +102,10 @@ typedef struct {
 
     /* Output: resolved calls accumulate here. */
     CBMResolvedCallArray *resolved_calls;
+    /* Existing parser call carriers for this file. Exact callable aliases
+     * retarget their occurrence and require the semantic result, preventing a
+     * same-named definition from winning through textual fallback. */
+    CBMCallArray *call_carriers;
 
     /* Active type-parameter substitution map (for generic methods/types).
      * Parallel arrays. NULL-terminated. */
@@ -106,6 +115,11 @@ typedef struct {
 
     /* Recursion guard for cs_eval_expr_type. */
     int eval_depth;
+
+    /* Recursion guard for the nested-type qualifier walk of
+     * cs_resolve_type_name: resolving `A.B` resolves the qualifier `A` as a
+     * type first, and a `using A = A.B;` alias cycles back into it. */
+    int qualifier_depth;
 
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;
@@ -137,6 +151,11 @@ const char *cs_resolve_type_name(CSLSPContext *ctx, const char *name);
 /* Look up a method on a type, walking base + interface chains. */
 const CBMRegisteredFunc *cs_lookup_method(CSLSPContext *ctx, const char *type_qn,
                                            const char *method_name);
+
+/* Apply the local AST-declared return-type refinement to an already populated
+ * registry. Kept as a production-used seam so post-registration signature
+ * preservation can be regression-tested directly. */
+void cbm_cs_refine_ast_return_types(CSLSPContext *ctx, CBMTypeRegistry *reg, TSNode root);
 
 /* Single-file entry: build registry from file defs + stdlib, run resolution. */
 void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,

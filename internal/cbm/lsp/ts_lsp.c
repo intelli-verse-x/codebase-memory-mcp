@@ -20,13 +20,18 @@
  * cbm_batch_ts_lsp_cross.
  *
  * Conventions (mirrors c_lsp / go_lsp):
- *   - All allocations go through ctx->arena; no malloc / free.
+ *   - Persistent results use ctx->arena; temporary walk/index buffers use tracked allocations.
  *   - ts_emit_resolved_call requires a non-NULL enclosing_func_qn — calls outside any
  *     function (module top-level) are not emitted.
  *   - eval_depth caps at TS_LSP_MAX_EVAL_DEPTH to defend against pathological recursion.
  */
 
 #include "ts_lsp.h"
+#include "../../../src/foundation/platform.h"
+#include "../helpers.h"
+#include "../../../src/foundation/log.h"
+#include "../../../src/foundation/mem_core.h"
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,9 +63,14 @@ void cbm_ts_full_registry_builds_reset(void) {
  * constructs it does not model. -1 = unlimited (no entry point armed it). */
 static _Thread_local long g_ts_type_budget = -1;
 static _Thread_local bool g_ts_type_budget_warned;
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Thread_local unsigned long g_ts_signature_lookup_work;
+static _Thread_local int g_ts_max_member_lookup_steps;
+static _Thread_local int g_ts_max_method_lookup_steps;
+#endif
 
 static void ts_type_budget_reset(size_t source_len) {
-    const char *e = getenv("CBM_TS_TYPE_BUDGET");
+    const char *e = cbm_runtime_getenv("CBM_TS_TYPE_BUDGET");
     if (e && e[0]) {
         long v = atol(e);
         g_ts_type_budget = (v > 0) ? v : -1;
@@ -69,6 +79,116 @@ static void ts_type_budget_reset(size_t source_len) {
     }
     g_ts_type_budget_warned = false;
 }
+
+/* Bumped on every degraded eval return (depth cap or budget exhaustion). An
+ * evaluation whose subtree bumped this counter must NOT be memoized: its value
+ * embeds the degradation, and first-eval-wins would freeze it for call sites
+ * that could have evaluated the node fully. */
+static _Thread_local unsigned long g_ts_eval_degraded;
+
+/* Expression-type memo (per file): node.id -> evaluated CBMType.
+ *
+ * ts_signature_for_call re-evaluates a call's argument expressions while
+ * resolving overloads, and boolean/spread chains re-enter the same
+ * subexpression once per enclosing alternative — the TS suite's
+ * objectSpreadRepeatedComplexity.js builds a union of 2^(n-1) members and
+ * measured 11+ s for a 3.6 KB file while emitting the same 5-node graph
+ * v0.9.0 emits in 0.14 s. Expression types are position-pure within a file
+ * pass (one node = one scope path, and the per-file walk is single-threaded
+ * and deterministic), so one eval per node is the correct semantics, not a
+ * cache trade-off. Degraded results are never stored (see
+ * g_ts_eval_degraded). Arena-backed, linear-probed, power-of-two capacity;
+ * grows by rehash and dies with the file pass. */
+typedef struct TsEvalMemo {
+    const void **keys; /* TSNode.id; NULL = empty slot */
+    const CBMType **vals;
+    uint32_t cap;
+    uint32_t count;
+} TsEvalMemo;
+
+static uint32_t ts_memo_slot(const TsEvalMemo *m, const void *id) {
+    uint64_t x = (uint64_t)(uintptr_t)id;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    uint32_t i = (uint32_t)x & (m->cap - 1);
+    while (m->keys[i] && m->keys[i] != id)
+        i = (i + 1) & (m->cap - 1);
+    return i;
+}
+
+static const CBMType *ts_memo_get(const TsEvalMemo *m, const void *id) {
+    if (!m || !m->cap)
+        return NULL;
+    uint32_t i = ts_memo_slot(m, id);
+    return m->keys[i] ? m->vals[i] : NULL;
+}
+
+static void ts_memo_put(TSLSPContext *ctx, const void *id, const CBMType *t) {
+    TsEvalMemo *m = ctx->eval_memo;
+    if (!m) {
+        m = (TsEvalMemo *)cbm_arena_alloc(ctx->arena, sizeof(*m));
+        if (!m)
+            return;
+        m->cap = 1024;
+        m->count = 0;
+        m->keys = (const void **)cbm_arena_alloc(ctx->arena, m->cap * sizeof(*m->keys));
+        m->vals = (const CBMType **)cbm_arena_alloc(ctx->arena, m->cap * sizeof(*m->vals));
+        if (!m->keys || !m->vals)
+            return;
+        memset(m->keys, 0, m->cap * sizeof(*m->keys));
+        memset(m->vals, 0, m->cap * sizeof(*m->vals));
+        ctx->eval_memo = m;
+    }
+    if (m->count * 10 >= m->cap * 7) { /* grow at 70% load */
+        TsEvalMemo bigger = {0};
+        bigger.cap = m->cap * 2;
+        bigger.keys = (const void **)cbm_arena_alloc(ctx->arena, bigger.cap * sizeof(*bigger.keys));
+        bigger.vals =
+            (const CBMType **)cbm_arena_alloc(ctx->arena, bigger.cap * sizeof(*bigger.vals));
+        if (!bigger.keys || !bigger.vals)
+            return; /* keep serving from the full table; stores stop */
+        memset(bigger.keys, 0, bigger.cap * sizeof(*bigger.keys));
+        memset(bigger.vals, 0, bigger.cap * sizeof(*bigger.vals));
+        for (uint32_t i = 0; i < m->cap; i++) {
+            if (!m->keys[i])
+                continue;
+            uint32_t j = ts_memo_slot(&bigger, m->keys[i]);
+            bigger.keys[j] = m->keys[i];
+            bigger.vals[j] = m->vals[i];
+        }
+        bigger.count = m->count;
+        *m = bigger; /* old arrays stay in the arena */
+    }
+    uint32_t i = ts_memo_slot(m, id);
+    if (!m->keys[i]) {
+        m->keys[i] = id;
+        m->vals[i] = t;
+        m->count++;
+    }
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Complexity-regression seam: expose the thread's remaining eval budget and
+ * the warned flag after a cbm_run_ts_lsp call. Budget units consumed are a
+ * deterministic work counter — the memo turns the spread-bomb class from
+ * O(2^n) evals into O(nodes), which tests assert without wall-clock. */
+long cbm_ts_lsp_test_budget_remaining(void) {
+    return g_ts_type_budget;
+}
+bool cbm_ts_lsp_test_budget_warned(void) {
+    return g_ts_type_budget_warned;
+}
+unsigned long cbm_ts_lsp_test_signature_lookup_work(void) {
+    return g_ts_signature_lookup_work;
+}
+int cbm_ts_lsp_test_max_member_lookup_steps(void) {
+    return g_ts_max_member_lookup_steps;
+}
+int cbm_ts_lsp_test_max_method_lookup_steps(void) {
+    return g_ts_max_method_lookup_steps;
+}
+#endif
 
 #define TS_LSP_MAX_EVAL_DEPTH 64
 #define TS_LSP_FIELD_LEN(s) ((uint32_t)(sizeof(s) - 1))
@@ -88,6 +208,10 @@ static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name);
 static const CBMType *lookup_member_type(TSLSPContext *ctx, const CBMType *recv, const char *name);
 static const CBMRegisteredFunc *lookup_method(TSLSPContext *ctx, const CBMType *recv,
                                               const char *method_name);
+typedef struct TSLookupState TSLookupState;
+static const CBMRegisteredFunc *lookup_method_at(TSLSPContext *ctx, const CBMType *recv,
+                                                 const char *method_name, int depth,
+                                                 TSLookupState *state);
 static char *node_text(TSLSPContext *ctx, TSNode node);
 
 // Collect a node's children into an arena array via a single O(n) cursor pass.
@@ -145,28 +269,72 @@ static TSNode find_first_kind(TSNode node, const char *kind) {
     return null_node;
 }
 
-static void ts_emit_resolved_call(TSLSPContext *ctx, const char *callee_qn, const char *strategy,
-                                  float confidence) {
+/* `reason` carries the name written at the site when it differs from the
+ * callee's leaf (`bar()` through `import { foo as bar }`): the pipeline joins an
+ * alias strategy by that name instead of by the callee QN's last segment. */
+static void ts_emit_resolved_call_reason_at(TSLSPContext *ctx, const char *callee_qn,
+                                            const char *strategy, float confidence,
+                                            const char *reason, TSNode site) {
     if (!ctx || !ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn)
         return;
-    CBMResolvedCall rc;
+    CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_func_qn;
     rc.callee_qn = callee_qn;
     rc.strategy = strategy ? strategy : "lsp_ts";
     rc.confidence = confidence;
-    rc.reason = NULL;
+    rc.reason = reason;
+    rc.kind = CBM_RESOLVED_INVOCATION;
+    if (!ts_node_is_null(site)) {
+        rc.site_start_byte = ts_node_start_byte(site);
+        rc.site_end_byte = ts_node_end_byte(site);
+    }
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
 }
 
-static void ts_emit_unresolved_call(TSLSPContext *ctx, const char *expr_text, const char *reason) {
+static void ts_emit_resolved_call_at(TSLSPContext *ctx, const char *callee_qn, const char *strategy,
+                                     float confidence, TSNode site) {
+    ts_emit_resolved_call_reason_at(ctx, callee_qn, strategy, confidence, NULL, site);
+}
+
+static void ts_emit_resolved_reference_reason(TSLSPContext *ctx, const char *callee_qn,
+                                              const char *strategy, float confidence,
+                                              const char *reason, TSNode site) {
+    if (!ctx || !ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn ||
+        ts_node_is_null(site)) {
+        return;
+    }
+    CBMResolvedCall rc = {0};
+    rc.caller_qn = ctx->enclosing_func_qn;
+    rc.callee_qn = callee_qn;
+    rc.strategy = strategy ? strategy : "lsp_ts_value_reference";
+    rc.confidence = confidence;
+    rc.reason = reason;
+    rc.kind = CBM_RESOLVED_CALL_REFERENCE;
+    rc.site_start_byte = ts_node_start_byte(site);
+    rc.site_end_byte = ts_node_end_byte(site);
+    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+}
+
+static void ts_emit_resolved_reference(TSLSPContext *ctx, const char *callee_qn,
+                                       const char *strategy, float confidence, TSNode site) {
+    ts_emit_resolved_reference_reason(ctx, callee_qn, strategy, confidence, NULL, site);
+}
+
+static void ts_emit_unresolved_call_at(TSLSPContext *ctx, const char *expr_text, const char *reason,
+                                       TSNode site) {
     if (!ctx || !ctx->resolved_calls || !ctx->enclosing_func_qn)
         return;
-    CBMResolvedCall rc;
+    CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_func_qn;
     rc.callee_qn = expr_text ? expr_text : "?";
     rc.strategy = "lsp_unresolved";
     rc.confidence = 0.0f;
     rc.reason = reason;
+    rc.kind = CBM_RESOLVED_INVOCATION;
+    if (!ts_node_is_null(site)) {
+        rc.site_start_byte = ts_node_start_byte(site);
+        rc.site_end_byte = ts_node_end_byte(site);
+    }
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
 }
 
@@ -636,6 +804,17 @@ static const CBMType *parse_ts_type_text(CBMArena *arena, const char *text, cons
         return cbm_type_named(arena, terminated);
     }
     return cbm_type_named(arena, cbm_arena_strndup(arena, text, len));
+}
+
+typedef struct {
+    const char *module_qn;
+} CBMTSLSPSignatureParserContext;
+
+static const CBMType *cbm_ts_lsp_parse_signature_param_text(CBMArena *arena, const char *text,
+                                                            void *parser_ctx) {
+    const CBMTSLSPSignatureParserContext *ctx = (const CBMTSLSPSignatureParserContext *)parser_ctx;
+    const char *module_qn = ctx && ctx->module_qn ? ctx->module_qn : "";
+    return parse_ts_type_text(arena, text, module_qn);
 }
 
 // Return param-type CBMType array from a CBMDefinition's param_types text array.
@@ -1242,14 +1421,134 @@ static const CBMType *simplify_type(TSLSPContext *ctx, const CBMType *t) {
     return t;
 }
 
+/* cbm_scope_lookup intentionally collapses an absent binding and an UNKNOWN
+ * binding to the same type. Reference resolution needs the stronger question:
+ * even an untyped local/parameter shadows an import and must block promotion. */
+static const CBMScope *ts_scope_binding_owner(const CBMScope *scope, const char *name) {
+    if (!name) {
+        return NULL;
+    }
+    for (const CBMScope *s = scope; s; s = s->parent) {
+        if (cbm_scope_lookup_local(s, name)) {
+            return s;
+        }
+    }
+    return NULL;
+}
+
+static bool ts_scope_has_binding(const CBMScope *scope, const char *name) {
+    return ts_scope_binding_owner(scope, name) != NULL;
+}
+
+/* The member an import binding names in its module: the exported name of a
+ * renamed named import (`foo` for `import { foo as bar }`, #2297), else the
+ * binding itself. Callers have already matched `local` to an import binding. */
+static const char *ts_import_export_name(const TSLSPContext *ctx, const char *local) {
+    if (!ctx || !local)
+        return local;
+    for (int i = 0; i < ctx->import_alias_count; i++) {
+        if (strcmp(ctx->import_alias_locals[i], local) == 0)
+            return ctx->import_alias_exports[i];
+    }
+    return local;
+}
+
+/* Full QN of an imported symbol. An import value is normally the module QN
+ * (symbol = module + "." + name), but may already be the symbol QN. When the
+ * module QN ends in ".name" the spelling is ambiguous: `Foo.ts` exporting
+ * `Foo` (module `x.Foo`, symbol `x.Foo.Foo`) looks exactly like an
+ * already-qualified value. Treating it as the symbol typed every imported
+ * same-name class as its module (#1354), so the registry decides: a
+ * registered `module.name` wins, else the value is the symbol. Two hashed
+ * lookups on a finalized/sealed registry, only in the ambiguous case. */
+static const char *ts_import_symbol_qn(TSLSPContext *ctx, const char *module_qn, const char *name) {
+    if (!ctx || !module_qn || !name) {
+        return NULL;
+    }
+    const char *appended = cbm_arena_sprintf(ctx->arena, "%s.%s", module_qn, name);
+    size_t module_len = strlen(module_qn);
+    size_t name_len = strlen(name);
+    if (module_len > name_len + 1 && module_qn[module_len - name_len - 1] == '.' &&
+        strcmp(module_qn + module_len - name_len, name) == 0) {
+        if (appended && (cbm_registry_lookup_type(ctx->registry, appended) ||
+                         cbm_registry_lookup_func(ctx->registry, appended))) {
+            return appended;
+        }
+        return module_qn;
+    }
+    return appended;
+}
+
+/* Same-file function values use only the exact current-module QN. No short-name,
+ * suffix, overload-arity, or project-wide uniqueness fallback is admissible. */
+static const CBMRegisteredFunc *ts_exact_same_module_function(TSLSPContext *ctx, const char *name) {
+    if (!ctx || !ctx->registry || !ctx->module_qn || !name ||
+        ts_scope_has_binding(ctx->current_scope, name)) {
+        return NULL;
+    }
+    const char *full_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
+    return full_qn ? cbm_registry_lookup_func(ctx->registry, full_qn) : NULL;
+}
+
+/* Return a function only when the local import binding maps to one unambiguous
+ * module and that module contains the exact QN of the member the binding names
+ * (the exported name for `import { foo as bar }`). A renamed import of a name
+ * the module does not export fails closed and remains USAGE. */
+static const CBMRegisteredFunc *ts_exact_imported_function(TSLSPContext *ctx, const char *name) {
+    if (!ctx || !ctx->registry || !name || ts_scope_has_binding(ctx->current_scope, name)) {
+        return NULL;
+    }
+    const char *matched_module = NULL;
+    for (int i = 0; i < ctx->import_count; i++) {
+        const char *local = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
+        const char *module_qn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
+        if (!local || !module_qn || strcmp(local, name) != 0) {
+            continue;
+        }
+        if (matched_module && strcmp(matched_module, module_qn) != 0) {
+            return NULL;
+        }
+        matched_module = module_qn;
+    }
+    if (!matched_module) {
+        return NULL;
+    }
+    const char *full_qn =
+        ts_import_symbol_qn(ctx, matched_module, ts_import_export_name(ctx, name));
+    return full_qn ? cbm_registry_lookup_func(ctx->registry, full_qn) : NULL;
+}
+
+static void ts_block_shadowed_reference_usage(TSLSPContext *ctx, const char *name, TSNode site) {
+    if (!ctx || !ctx->usages || !name || !ctx->enclosing_func_qn || ts_node_is_null(site)) {
+        return;
+    }
+    const CBMScope *binding_scope = ts_scope_binding_owner(ctx->current_scope, name);
+    if (!binding_scope) {
+        return;
+    }
+    uint32_t start = ts_node_start_byte(site);
+    uint32_t end = ts_node_end_byte(site);
+    for (int i = 0; i < ctx->usages->count; i++) {
+        CBMUsage *usage = &ctx->usages->items[i];
+        if (usage->kind == CBM_USAGE_VALUE && usage->may_be_call_reference && usage->ref_name &&
+            usage->enclosing_func_qn && strcmp(usage->ref_name, name) == 0 &&
+            strcmp(usage->enclosing_func_qn, ctx->enclosing_func_qn) == 0 &&
+            usage->site_start_byte == start && usage->site_end_byte == end) {
+            usage->semantic_reference_blocked = true;
+            usage->semantic_reference_local_shadow = binding_scope->parent != NULL;
+            return;
+        }
+    }
+}
+
 static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name) {
     if (!ctx || !name)
         return cbm_type_unknown();
 
     // Scope lookup (params, locals).
     const CBMType *t = cbm_scope_lookup(ctx->current_scope, name);
-    if (t && !cbm_type_is_unknown(t))
-        return t;
+    if (ts_scope_has_binding(ctx->current_scope, name))
+        return t ? t : cbm_type_unknown();
 
     // Imports: bare identifier matching an import binding. Compute the full symbol QN
     // and look it up in the registry. If it's a registered func, return its signature;
@@ -1261,17 +1560,9 @@ static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name) {
         if (!local || !mqn || strcmp(local, name) != 0)
             continue;
 
-        // Construct the full symbol QN: if mqn already ends in ".name" use it; else
-        // append ".name". This matches `resolve_type_with_imports`' convention.
-        size_t mqn_len = strlen(mqn);
-        size_t name_len = strlen(name);
-        const char *full_qn;
-        if (mqn_len > name_len + 1 && mqn[mqn_len - name_len - 1] == '.' &&
-            strcmp(mqn + mqn_len - name_len, name) == 0) {
-            full_qn = mqn;
-        } else {
-            full_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, name);
-        }
+        // Construct the full symbol QN using the same convention as exact
+        // imported function-value resolution.
+        const char *full_qn = ts_import_symbol_qn(ctx, mqn, ts_import_export_name(ctx, name));
 
         // Try the symbol lookup precedence: registered func, then registered type.
         const CBMRegisteredFunc *f = cbm_registry_lookup_func(ctx->registry, full_qn);
@@ -1330,28 +1621,77 @@ static const char *builtin_wrapper_class(const char *builtin_name) {
 }
 
 // Look up a property `name` on a receiver type. Returns the property type or UNKNOWN.
-static const CBMType *lookup_member_type_inner(TSLSPContext *ctx, const CBMType *recv,
-                                               const char *name);
-
 #define TS_LSP_MAX_MEMBER_DEPTH 64
+#define TS_LSP_INLINE_VISITED_TYPES 16
 
-/* Depth-guarded entry: member lookup recurses through wrapper classes, union
- * members and registered-type expansion; cyclic type graphs in real-world TS
- * (microsoft/TypeScript reallyLargeFile.ts) recursed without bound — SIGBUS
- * stack overflow under endless lookup_member_type frames. Past the cap the
- * member resolves as unknown — graceful degradation, not a crash. */
-static const CBMType *lookup_member_type(TSLSPContext *ctx, const CBMType *recv, const char *name) {
-    if (!ctx || ctx->member_depth >= TS_LSP_MAX_MEMBER_DEPTH)
-        return cbm_type_unknown();
-    ctx->member_depth++;
-    const CBMType *r = lookup_member_type_inner(ctx, recv, name);
-    ctx->member_depth--;
-    return r;
+typedef struct {
+    const char *qn;
+    int depth;
+} TSVisitedType;
+
+struct TSLookupState {
+    TSVisitedType inline_visited[TS_LSP_INLINE_VISITED_TYPES];
+    TSVisitedType *visited;
+    int visited_count;
+    int visited_capacity;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    int steps;
+#endif
+};
+
+/* A named type needs another visit only when reached along a shallower path.
+ * Grow the visited table rather than silently dropping entries at a fixed cap:
+ * the depth bound then limits each named type to at most 64 admitted visits. */
+static bool ts_lookup_visit_named(CBMArena *arena, TSLookupState *state, const char *qn,
+                                  int depth) {
+    for (int i = 0; i < state->visited_count; i++) {
+        if (strcmp(state->visited[i].qn, qn) == 0) {
+            if (state->visited[i].depth <= depth)
+                return false;
+            state->visited[i].depth = depth;
+            return true;
+        }
+    }
+    if (!state->visited) {
+        state->visited = state->inline_visited;
+        state->visited_capacity = TS_LSP_INLINE_VISITED_TYPES;
+    } else if (state->visited_count == state->visited_capacity) {
+        int capacity = state->visited_capacity * 2;
+        TSVisitedType *larger =
+            (TSVisitedType *)cbm_arena_alloc(arena, (size_t)capacity * sizeof(*larger));
+        if (!larger) {
+            fprintf(stderr, "[tslsp] lookup visited allocation failed\n");
+            return false;
+        }
+        memcpy(larger, state->visited, (size_t)state->visited_count * sizeof(*larger));
+        state->visited = larger;
+        state->visited_capacity = capacity;
+    }
+    state->visited[state->visited_count++] = (TSVisitedType){.qn = qn, .depth = depth};
+    return true;
 }
 
-static const CBMType *lookup_member_type_inner(TSLSPContext *ctx, const CBMType *recv,
-                                               const char *name) {
-    if (!ctx || !recv || !name)
+static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *recv,
+                                            const char *name, int depth, TSLookupState *state);
+
+/* Depth and shallower-only named-type visits bound work on cyclic inheritance. */
+static const CBMType *lookup_member_type(TSLSPContext *ctx, const CBMType *recv, const char *name) {
+    TSLookupState state = {0};
+    const CBMType *result = lookup_member_type_at(ctx, recv, name, 0, &state);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (state.steps > g_ts_max_member_lookup_steps)
+        g_ts_max_member_lookup_steps = state.steps;
+#endif
+    return result;
+}
+
+static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *recv,
+                                            const char *name, int depth, TSLookupState *state) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (state)
+        state->steps++;
+#endif
+    if (!ctx || !recv || !name || !state || depth >= TS_LSP_MAX_MEMBER_DEPTH)
         return cbm_type_unknown();
     const CBMType *base = simplify_type(ctx, recv);
     if (!base)
@@ -1365,7 +1705,7 @@ static const CBMType *lookup_member_type_inner(TSLSPContext *ctx, const CBMType 
         const char *wrap = builtin_wrapper_class(base->data.builtin.name);
         if (wrap) {
             const CBMType *wrapped = cbm_type_named(ctx->arena, wrap);
-            return lookup_member_type(ctx, wrapped, name);
+            return lookup_member_type_at(ctx, wrapped, name, depth + 1, state);
         }
         return cbm_type_unknown();
     }
@@ -1420,7 +1760,10 @@ static const CBMType *lookup_member_type_inner(TSLSPContext *ctx, const CBMType 
         // first hit instead of building a union of results.)
         if (base->data.union_type.members) {
             for (int i = 0; i < base->data.union_type.count; i++) {
-                const CBMType *m = lookup_member_type(ctx, base->data.union_type.members[i], name);
+                if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH)
+                    break;
+                const CBMType *m = lookup_member_type_at(ctx, base->data.union_type.members[i],
+                                                         name, depth + 1, state);
                 if (!cbm_type_is_unknown(m))
                     return m;
             }
@@ -1431,7 +1774,10 @@ static const CBMType *lookup_member_type_inner(TSLSPContext *ctx, const CBMType 
     if (base->kind == CBM_TYPE_INTERSECTION) {
         if (base->data.union_type.members) {
             for (int i = 0; i < base->data.union_type.count; i++) {
-                const CBMType *m = lookup_member_type(ctx, base->data.union_type.members[i], name);
+                if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH)
+                    break;
+                const CBMType *m = lookup_member_type_at(ctx, base->data.union_type.members[i],
+                                                         name, depth + 1, state);
                 if (!cbm_type_is_unknown(m))
                     return m;
             }
@@ -1443,6 +1789,10 @@ static const CBMType *lookup_member_type_inner(TSLSPContext *ctx, const CBMType 
         return cbm_type_unknown();
 
     const char *recv_qn = base->data.named.qualified_name;
+    if (!recv_qn)
+        return cbm_type_unknown();
+    if (!ts_lookup_visit_named(ctx->arena, state, recv_qn, depth))
+        return cbm_type_unknown();
     const CBMRegisteredType *rt = cbm_registry_resolve_alias(ctx->registry, recv_qn);
     if (!rt) {
         rt = cbm_registry_lookup_type(ctx->registry, recv_qn);
@@ -1472,8 +1822,10 @@ static const CBMType *lookup_member_type_inner(TSLSPContext *ctx, const CBMType 
     // Walk extends/implements.
     if (rt->embedded_types) {
         for (int i = 0; rt->embedded_types[i]; i++) {
+            if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH)
+                break;
             const CBMType *parent = cbm_type_named(ctx->arena, rt->embedded_types[i]);
-            const CBMType *m = lookup_member_type(ctx, parent, name);
+            const CBMType *m = lookup_member_type_at(ctx, parent, name, depth + 1, state);
             if (!cbm_type_is_unknown(m))
                 return m;
         }
@@ -1556,10 +1908,32 @@ static const CBMType *eval_indexed_access(TSLSPContext *ctx, const CBMType *obj,
     return cbm_type_unknown();
 }
 
-// Look up a method on a receiver type — returns the registered func.
+/* Depth-guarded entry, same contract as lookup_member_type: the method walk
+ * recurses through wrapper classes, union members and the extends/implements
+ * chain. A cyclic chain (#1743: the Effect idiom `class Service extends
+ * Context.Service<Service, I>()(...)` whose base resolved to the class itself)
+ * recursed without bound and overflowed the resolver thread's stack. Past the
+ * cap the method is simply not found. */
 static const CBMRegisteredFunc *lookup_method(TSLSPContext *ctx, const CBMType *recv,
                                               const char *method_name) {
-    if (!ctx || !recv || !method_name)
+    TSLookupState state = {0};
+    const CBMRegisteredFunc *result = lookup_method_at(ctx, recv, method_name, 0, &state);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (state.steps > g_ts_max_method_lookup_steps)
+        g_ts_max_method_lookup_steps = state.steps;
+#endif
+    return result;
+}
+
+/* Depth and shallower-only named-type visits bound cyclic inheritance work. */
+static const CBMRegisteredFunc *lookup_method_at(TSLSPContext *ctx, const CBMType *recv,
+                                                 const char *method_name, int depth,
+                                                 TSLookupState *state) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (state)
+        state->steps++;
+#endif
+    if (!ctx || !recv || !method_name || !state || depth >= TS_LSP_MAX_MEMBER_DEPTH)
         return NULL;
     const CBMType *base = simplify_type(ctx, recv);
     if (!base)
@@ -1573,7 +1947,7 @@ static const CBMRegisteredFunc *lookup_method(TSLSPContext *ctx, const CBMType *
         const char *wrap = builtin_wrapper_class(base->data.builtin.name);
         if (wrap) {
             const CBMType *wrapped = cbm_type_named(ctx->arena, wrap);
-            return lookup_method(ctx, wrapped, method_name);
+            return lookup_method_at(ctx, wrapped, method_name, depth + 1, state);
         }
         return NULL;
     }
@@ -1602,8 +1976,10 @@ static const CBMRegisteredFunc *lookup_method(TSLSPContext *ctx, const CBMType *
     if (base->kind == CBM_TYPE_UNION || base->kind == CBM_TYPE_INTERSECTION) {
         if (base->data.union_type.members) {
             for (int i = 0; i < base->data.union_type.count; i++) {
-                const CBMRegisteredFunc *f =
-                    lookup_method(ctx, base->data.union_type.members[i], method_name);
+                if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH)
+                    break;
+                const CBMRegisteredFunc *f = lookup_method_at(ctx, base->data.union_type.members[i],
+                                                              method_name, depth + 1, state);
                 if (f)
                     return f;
             }
@@ -1614,6 +1990,11 @@ static const CBMRegisteredFunc *lookup_method(TSLSPContext *ctx, const CBMType *
     if (base->kind != CBM_TYPE_NAMED)
         return NULL;
     const char *recv_qn = base->data.named.qualified_name;
+    if (!recv_qn)
+        return NULL;
+
+    if (!ts_lookup_visit_named(ctx->arena, state, recv_qn, depth))
+        return NULL;
 
     const CBMRegisteredFunc *f =
         cbm_registry_lookup_method_aliased(ctx->registry, recv_qn, method_name);
@@ -1624,13 +2005,249 @@ static const CBMRegisteredFunc *lookup_method(TSLSPContext *ctx, const CBMType *
     const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, recv_qn);
     if (rt && rt->embedded_types) {
         for (int i = 0; rt->embedded_types[i]; i++) {
+            if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH)
+                break;
             const CBMType *parent = cbm_type_named(ctx->arena, rt->embedded_types[i]);
-            const CBMRegisteredFunc *pf = lookup_method(ctx, parent, method_name);
+            const CBMRegisteredFunc *pf =
+                lookup_method_at(ctx, parent, method_name, depth + 1, state);
             if (pf)
                 return pf;
         }
     }
     return NULL;
+}
+
+/* Select one overload for both edge emission and call-expression return
+ * typing.  The first lookup preserves wrapper/alias/inheritance/template/union
+ * traversal; its receiver identifies the concrete overload set. */
+static const CBMRegisteredFunc *ts_lookup_method_for_call(TSLSPContext *ctx, const CBMType *recv,
+                                                          const char *method_name, TSNode args) {
+    const CBMRegisteredFunc *fallback = lookup_method(ctx, recv, method_name);
+    if (!fallback || !fallback->receiver_type)
+        return fallback;
+
+    int arg_count = ts_node_is_null(args) ? 0 : (int)ts_node_named_child_count(args);
+    const CBMRegisteredFunc *selected = NULL;
+    if (arg_count > 0 && arg_count <= 16) {
+        const CBMType *arg_types[16] = {0};
+        for (int i = 0; i < arg_count; i++) {
+            arg_types[i] = ts_eval_expr_type(ctx, ts_node_named_child(args, (uint32_t)i));
+        }
+        selected = cbm_registry_lookup_method_by_types(ctx->registry, fallback->receiver_type,
+                                                       method_name, arg_types, arg_count);
+    } else {
+        selected = cbm_registry_lookup_method_by_args(ctx->registry, fallback->receiver_type,
+                                                      method_name, arg_count);
+    }
+    return selected ? selected : fallback;
+}
+
+/* Select a free function/namespace export by the same ordered argument types
+ * used for method overloads.  Edge emission and expression return typing must
+ * share this decision; otherwise the graph can point at one overload while a
+ * chained call is typed from another. */
+static const CBMRegisteredFunc *ts_lookup_symbol_for_call(TSLSPContext *ctx, const char *module_qn,
+                                                          const char *symbol_name, TSNode args) {
+    if (!ctx || !ctx->registry || !module_qn || !symbol_name)
+        return NULL;
+
+    /* Import maps may carry either a module QN or an already-qualified symbol
+     * QN.  The registry overload APIs accept the former, so strip one exact
+     * trailing `.symbol` before lookup instead of producing x.symbol.symbol. */
+    const char *lookup_module = module_qn;
+    size_t module_len = strlen(module_qn);
+    size_t symbol_len = strlen(symbol_name);
+    if (module_len > symbol_len + 1 && module_qn[module_len - symbol_len - 1] == '.' &&
+        strcmp(module_qn + module_len - symbol_len, symbol_name) == 0) {
+        lookup_module = cbm_arena_strndup(ctx->arena, module_qn, module_len - symbol_len - 1);
+    }
+
+    int arg_count = ts_node_is_null(args) ? 0 : (int)ts_node_named_child_count(args);
+    const CBMRegisteredFunc *selected = NULL;
+    if (arg_count > 0 && arg_count <= 16) {
+        const CBMType *arg_types[16] = {0};
+        for (int i = 0; i < arg_count; i++)
+            arg_types[i] = ts_eval_expr_type(ctx, ts_node_named_child(args, (uint32_t)i));
+        selected = cbm_registry_lookup_symbol_by_types(ctx->registry, lookup_module, symbol_name,
+                                                       arg_types, arg_count);
+    }
+    if (!selected) {
+        selected = cbm_registry_lookup_symbol_by_args(ctx->registry, lookup_module, symbol_name,
+                                                      arg_count);
+    }
+    return selected;
+}
+
+/* Map one local import binding to its module.  Duplicate bindings from
+ * different modules are ambiguous and deliberately fail closed. */
+static const char *ts_import_module_for_local(const TSLSPContext *ctx, const char *local_name,
+                                              bool *out_matched) {
+    if (out_matched)
+        *out_matched = false;
+    if (!ctx || !local_name)
+        return NULL;
+    const char *matched = NULL;
+    for (int i = 0; i < ctx->import_count; i++) {
+        const char *local = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
+        const char *module_qn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
+        if (!local || !module_qn || strcmp(local, local_name) != 0)
+            continue;
+        if (out_matched)
+            *out_matched = true;
+        if (matched && strcmp(matched, module_qn) != 0)
+            return NULL;
+        matched = module_qn;
+    }
+    return matched;
+}
+
+/* Type of `new C()` for a bare class name, in TS scoping order: a class
+ * declared in this module, else the class an unambiguous import binding
+ * names, else the historical current-module spelling. Without the import
+ * step (#1354) `new ImportedClass()` was typed as a phantom current-module
+ * class, so every method call on the instance missed the registry and the
+ * cross-file edge was lost while the same code in the class's own file
+ * resolved. One hashed type lookup; the registry is only read. */
+static const CBMType *ts_new_bare_class_type(TSLSPContext *ctx, const char *cname) {
+    if (!ctx->module_qn)
+        return cbm_type_named(ctx->arena, cname);
+    const char *local_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cname);
+    if (cbm_registry_lookup_type(ctx->registry, local_qn))
+        return cbm_type_named(ctx->arena, local_qn);
+    bool import_matched = false;
+    const char *import_module = ts_import_module_for_local(ctx, cname, &import_matched);
+    if (import_module)
+        return cbm_type_named(
+            ctx->arena, ts_import_symbol_qn(ctx, import_module, ts_import_export_name(ctx, cname)));
+    return cbm_type_named(ctx->arena, local_qn);
+}
+
+/* Type of a `new_expression`: a bare constructor name follows TS scoping
+ * (ts_new_bare_class_type), a dotted one is taken as spelled. NULL when the
+ * node carries no constructor. Shared by expression evaluation and by the
+ * field-initializer inference in ast_sweep_shapes, so `const t = new C()`
+ * and `private t = new C()` type the instance identically. */
+static const CBMType *ts_new_expression_type(TSLSPContext *ctx, TSNode node) {
+    TSNode ctor = ts_node_child_by_field_name(node, "constructor", TS_LSP_FIELD_LEN("constructor"));
+    if (ts_node_is_null(ctor))
+        return NULL;
+    char *cname = node_text(ctx, ctor);
+    if (!cname)
+        return NULL;
+    return strchr(cname, '.') == NULL ? ts_new_bare_class_type(ctx, cname)
+                                      : cbm_type_named(ctx->arena, cname);
+}
+
+static const CBMRegisteredFunc *ts_lookup_namespace_call(TSLSPContext *ctx, const char *object_name,
+                                                         const char *method_name, TSNode args,
+                                                         bool *out_is_import) {
+    if (out_is_import)
+        *out_is_import = false;
+    bool import_matched = false;
+    const char *import_module = ts_import_module_for_local(ctx, object_name, &import_matched);
+    if (out_is_import)
+        *out_is_import = import_matched;
+    if (import_matched) {
+        /* An import binding lexically shadows a same-named local namespace.
+         * Ambiguous imports and missing imported symbols both fail closed. */
+        return import_module ? ts_lookup_symbol_for_call(ctx, import_module, method_name, args)
+                             : NULL;
+    }
+    /* TypeScript namespaces are module-like lexical scopes. Inside `namespace
+     * App`, `Utils.fn()` addresses App.Utils.fn, not a typed instance named
+     * Utils. Require an exact registered function so ordinary unknown objects
+     * still fall through to receiver-type dispatch. */
+    if (ctx && ctx->module_qn && object_name) {
+        const char *local_module =
+            cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, object_name);
+        return local_module ? ts_lookup_symbol_for_call(ctx, local_module, method_name, args)
+                            : NULL;
+    }
+    return NULL;
+}
+
+/* Preserve the generic receiver substitution historically performed by
+ * lookup_member_type().  Only substitute when the selected method belongs to
+ * that template owner; inherited methods may declare unrelated type params. */
+static const CBMType *ts_method_signature_for_receiver(TSLSPContext *ctx, const CBMType *recv,
+                                                       const CBMRegisteredFunc *method) {
+    if (!method || !method->signature)
+        return NULL;
+    const CBMType *base = simplify_type(ctx, recv);
+    base = base ? unwrap_passthrough_template(base) : NULL;
+    if (!base || base->kind != CBM_TYPE_TEMPLATE || !base->data.template_type.template_args) {
+        return method->signature;
+    }
+
+    const CBMRegisteredType *registered =
+        cbm_registry_lookup_type(ctx->registry, base->data.template_type.template_name);
+    if (!registered || !registered->qualified_name || !registered->type_param_names ||
+        !method->receiver_type || strcmp(registered->qualified_name, method->receiver_type) != 0) {
+        return method->signature;
+    }
+    const CBMType *substituted =
+        cbm_type_substitute(ctx->arena, method->signature, registered->type_param_names,
+                            base->data.template_type.template_args);
+    return substituted ? substituted : method->signature;
+}
+
+/* Return the function signature selected at this call site.  This is the
+ * single boundary shared by chained return typing and contextual callback
+ * typing; both must observe the same overload as edge resolution. */
+static const CBMType *ts_signature_for_call(TSLSPContext *ctx, TSNode function, TSNode args) {
+    if (!ctx || ts_node_is_null(function))
+        return NULL;
+
+    if (node_kind_is(function, "member_expression")) {
+        TSNode object = ts_node_child_by_field_name(function, "object", TS_LSP_FIELD_LEN("object"));
+        TSNode property =
+            ts_node_child_by_field_name(function, "property", TS_LSP_FIELD_LEN("property"));
+        if (ts_node_is_null(object) || ts_node_is_null(property))
+            return NULL;
+
+        char *method_name = node_text(ctx, property);
+        if (!method_name)
+            return NULL;
+
+        if (node_kind_is(object, "identifier")) {
+            char *object_name = node_text(ctx, object);
+            if (!ts_scope_has_binding(ctx->current_scope, object_name)) {
+                bool is_import = false;
+                const CBMRegisteredFunc *namespace_func =
+                    ts_lookup_namespace_call(ctx, object_name, method_name, args, &is_import);
+                if (namespace_func || is_import)
+                    return namespace_func ? namespace_func->signature : NULL;
+            }
+        }
+
+        const CBMType *recv = ts_eval_expr_type(ctx, object);
+        const CBMRegisteredFunc *method = ts_lookup_method_for_call(ctx, recv, method_name, args);
+        const CBMType *signature = ts_method_signature_for_receiver(ctx, recv, method);
+        /* Callable fields still use ordinary member typing. Reuse the receiver
+         * already evaluated above so deep fluent chains remain linear. */
+        return signature ? signature : lookup_member_type(ctx, recv, method_name);
+    }
+
+    if (node_kind_is(function, "identifier")) {
+        char *name = node_text(ctx, function);
+        if (name && ts_scope_has_binding(ctx->current_scope, name))
+            return type_of_identifier(ctx, name);
+        if (name) {
+            const CBMRegisteredFunc *registered = NULL;
+            if (ctx->module_qn)
+                registered = ts_lookup_symbol_for_call(ctx, ctx->module_qn, name, args);
+            if (!registered) {
+                const char *module_qn = ts_import_module_for_local(ctx, name, NULL);
+                if (module_qn)
+                    registered = ts_lookup_symbol_for_call(ctx, module_qn,
+                                                           ts_import_export_name(ctx, name), args);
+            }
+            if (registered)
+                return registered->signature;
+        }
+    }
+
+    return ts_eval_expr_type(ctx, function);
 }
 
 // Pull the underlying return type out of a FUNC signature, collapsing single-element
@@ -1655,9 +2272,43 @@ static const CBMType *return_type_of(CBMArena *arena, const CBMType *sig) {
 const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
     if (!ctx || ts_node_is_null(node))
         return cbm_type_unknown();
-    if (ctx->eval_depth > TS_LSP_MAX_EVAL_DEPTH)
+    /* Memo hit: O(1), charges no budget, ignores depth — the value came from a
+     * completed, non-degraded evaluation of this exact node. */
+    {
+        const CBMType *memo = ts_memo_get(ctx->eval_memo, node.id);
+        if (memo)
+            return memo;
+    }
+    if (ctx->eval_depth > TS_LSP_MAX_EVAL_DEPTH) {
+        g_ts_eval_degraded++;
         return cbm_type_unknown();
+    }
+    /* Depth alone does not bound WORK: crafted expressions (e.g. the TS test
+     * suite's repeated object spreads) stay under the depth cap while fanning
+     * out exponentially — one 3.6 KB baseline file measured 11 s here. Charge
+     * the same per-file budget the type-text parser uses and degrade to
+     * UNKNOWN on exhaustion, exactly like that path. */
+    if (g_ts_type_budget >= 0) {
+        /* An eval entry does ~two orders of magnitude more work than one
+         * text-parse unit (allocations, lookups, recursion bookkeeping), so it
+         * charges accordingly — otherwise the default per-file budget still
+         * permits ~12 s of evaluation on a crafted file. Normal files run
+         * hundreds-to-thousands of entries, far under any budget. */
+        g_ts_type_budget -= 16;
+        if (g_ts_type_budget < 0) {
+            if (!g_ts_type_budget_warned) {
+                g_ts_type_budget_warned = true;
+                fprintf(stderr, "  [tslsp] expression-eval budget exhausted; degrading to "
+                                "unknown\n");
+            }
+            g_ts_eval_degraded++;
+            return cbm_type_unknown();
+        }
+    }
     ctx->eval_depth++;
+    /* Snapshot for the memo-store guard: any degraded return in this subtree
+     * bumps the counter and blocks the store below. */
+    unsigned long degraded_before = g_ts_eval_degraded;
 
     const CBMType *result = cbm_type_unknown();
     const char *kind = ts_node_type(node);
@@ -1713,24 +2364,15 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
                 result = lookup_member_type(ctx, recv, pname);
         }
     } else if (strcmp(kind, "new_expression") == 0) {
-        TSNode ctor =
-            ts_node_child_by_field_name(node, "constructor", TS_LSP_FIELD_LEN("constructor"));
-        if (!ts_node_is_null(ctor)) {
-            char *cname = node_text(ctx, ctor);
-            if (cname) {
-                // Bare class name → qualify against module.
-                if (strchr(cname, '.') == NULL && ctx->module_qn) {
-                    const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cname);
-                    result = cbm_type_named(ctx->arena, qn);
-                } else {
-                    result = cbm_type_named(ctx->arena, cname);
-                }
-            }
-        }
+        const CBMType *nt = ts_new_expression_type(ctx, node);
+        if (nt)
+            result = nt;
     } else if (strcmp(kind, "call_expression") == 0) {
         TSNode fn = ts_node_child_by_field_name(node, "function", TS_LSP_FIELD_LEN("function"));
         if (!ts_node_is_null(fn)) {
-            const CBMType *fn_type = ts_eval_expr_type(ctx, fn);
+            TSNode call_args =
+                ts_node_child_by_field_name(node, "arguments", TS_LSP_FIELD_LEN("arguments"));
+            const CBMType *fn_type = ts_signature_for_call(ctx, fn, call_args);
             if (ctx->debug) {
                 fprintf(stderr, "[ts_lsp] eval call_expression: fn_kind=%s fn_type_kind=%d\n",
                         ts_node_type(fn), fn_type ? (int)fn_type->kind : -1);
@@ -1760,8 +2402,7 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
                 // inferTypeArguments — single-pass, argument-driven.
                 if (result && result->kind == CBM_TYPE_TYPE_PARAM &&
                     fn_type->data.func.param_types) {
-                    TSNode args = ts_node_child_by_field_name(node, "arguments",
-                                                              TS_LSP_FIELD_LEN("arguments"));
+                    TSNode args = call_args;
                     if (!ts_node_is_null(args)) {
                         // Build a list of inferred type-param names + arg types.
                         const char *inf_names[8] = {0};
@@ -1916,6 +2557,11 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
     }
 
     ctx->eval_depth--;
+    /* Store only completed, non-degraded evaluations (see g_ts_eval_degraded);
+     * result is never NULL here (initialized to unknown), so NULL stays the
+     * empty-slot sentinel. */
+    if (result && g_ts_eval_degraded == degraded_before)
+        ts_memo_put(ctx, node.id, result);
     return result;
 }
 
@@ -1952,14 +2598,8 @@ static const CBMType *resolve_type_with_imports(TSLSPContext *ctx, const CBMType
                 continue;
             if (strcmp(lname, bare) != 0)
                 continue;
-            // Heuristic: if mqn already ends in ".bare" use as-is; otherwise append.
-            size_t mqn_len = strlen(mqn);
-            size_t bare_len = strlen(bare);
-            if (mqn_len > bare_len + 1 && mqn[mqn_len - bare_len - 1] == '.' &&
-                strcmp(mqn + mqn_len - bare_len, bare) == 0) {
-                return cbm_type_named(ctx->arena, mqn);
-            }
-            return cbm_type_named(ctx->arena, cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, bare));
+            return cbm_type_named(ctx->arena,
+                                  ts_import_symbol_qn(ctx, mqn, ts_import_export_name(ctx, bare)));
         }
         return t;
     }
@@ -2263,17 +2903,102 @@ void ts_process_statement(TSLSPContext *ctx, TSNode node) {
 
 // ── Call resolution + tree walk ───────────────────────────────────────────────
 
+static void resolve_value_references_at(TSLSPContext *ctx, TSNode call_node) {
+    if (!ctx || !ctx->enclosing_func_qn) {
+        return;
+    }
+    TSNode args =
+        ts_node_child_by_field_name(call_node, "arguments", TS_LSP_FIELD_LEN("arguments"));
+    if (ts_node_is_null(args)) {
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        if (node_kind_is(arg, "member_expression")) {
+            /* A direct `receiver.method` value can be promoted only when a
+             * lexical receiver has one concrete registered method.  Reject
+             * unions/intersections here: lookup_method() otherwise returns the
+             * first member, which would turn a multi-target value into false
+             * precision. */
+            if (!ctx->cross_file_mode) {
+                continue;
+            }
+            TSNode object = ts_node_child_by_field_name(arg, "object", TS_LSP_FIELD_LEN("object"));
+            TSNode property =
+                ts_node_child_by_field_name(arg, "property", TS_LSP_FIELD_LEN("property"));
+            if (!node_kind_is(object, "identifier") ||
+                !node_kind_is(property, "property_identifier")) {
+                continue;
+            }
+            char *object_name = node_text(ctx, object);
+            char *method_name = node_text(ctx, property);
+            if (!object_name || !method_name ||
+                !ts_scope_has_binding(ctx->current_scope, object_name)) {
+                continue;
+            }
+            const CBMType *receiver = ts_eval_expr_type(ctx, object);
+            const CBMType *base = receiver ? simplify_type(ctx, receiver) : NULL;
+            base = base ? unwrap_passthrough_template(base) : NULL;
+            if (!base || (base->kind != CBM_TYPE_NAMED && base->kind != CBM_TYPE_TEMPLATE)) {
+                continue;
+            }
+            const CBMRegisteredFunc *target = lookup_method(ctx, receiver, method_name);
+            if (target && target->qualified_name) {
+                ts_emit_resolved_reference(ctx, target->qualified_name,
+                                           "lsp_ts_bound_method_value_reference", 0.95f, property);
+            }
+            continue;
+        }
+        if (!node_kind_is(arg, "identifier")) {
+            continue;
+        }
+        char *name = node_text(ctx, arg);
+        if (ts_scope_has_binding(ctx->current_scope, name)) {
+            ts_block_shadowed_reference_usage(ctx, name, arg);
+            continue;
+        }
+        /* Per-file resolution still performs the scope/shadow check above, but
+         * promotion waits for the project-wide registry phase where the graph
+         * target can be proved and materialized. */
+        if (!ctx->cross_file_mode) {
+            continue;
+        }
+        const CBMRegisteredFunc *target = ts_exact_same_module_function(ctx, name);
+        const char *strategy = "lsp_ts_same_module_value_reference";
+        const char *reason = NULL;
+        if (!target) {
+            target = ts_exact_imported_function(ctx, name);
+            strategy = "lsp_ts_import_value_reference";
+            /* `import { foo as bar }`: the site names `bar`, the target is `foo`. */
+            if (target && ts_import_export_name(ctx, name) != name) {
+                strategy = "lsp_callable_value_reference";
+                reason = name;
+            }
+        }
+        if (target) {
+            ts_emit_resolved_reference_reason(ctx, target->qualified_name, strategy, 0.95f, reason,
+                                              arg);
+        }
+    }
+}
+
+static TSNode unwrap_await_callee(TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "await_expression") != 0 ||
+        ts_node_named_child_count(node) == 0) {
+        return node;
+    }
+    return ts_node_named_child(node, 0);
+}
+
 static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
     TSNode fn = ts_node_child_by_field_name(call_node, "function", TS_LSP_FIELD_LEN("function"));
+    fn = unwrap_await_callee(fn);
     if (ts_node_is_null(fn))
         return;
 
-    // Argument count.
-    int arg_count = 0;
     TSNode args =
         ts_node_child_by_field_name(call_node, "arguments", TS_LSP_FIELD_LEN("arguments"));
-    if (!ts_node_is_null(args))
-        arg_count = (int)ts_node_named_child_count(args);
 
     const char *fk = ts_node_type(fn);
 
@@ -2287,59 +3012,33 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
                 // Identifier as namespace import: `name.fn()` or `mod.fn()`.
                 if (node_kind_is(obj, "identifier")) {
                     char *on = node_text(ctx, obj);
-                    if (on) {
-                        for (int i = 0; i < ctx->import_count; i++) {
-                            const char *lname =
-                                ctx->import_local_names ? ctx->import_local_names[i] : NULL;
-                            const char *mqn =
-                                ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
-                            if (lname && mqn && strcmp(lname, on) == 0) {
-                                const CBMRegisteredFunc *f = cbm_registry_lookup_symbol_by_args(
-                                    ctx->registry, mqn, mname, arg_count);
-                                if (f) {
-                                    ts_emit_resolved_call(ctx, f->qualified_name,
-                                                          "lsp_ts_namespace", 0.95f);
-                                    return;
-                                }
-                                ts_emit_unresolved_call(
-                                    ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", on, mname),
-                                    "module_symbol_not_in_registry");
-                                return;
-                            }
+                    if (on && !ts_scope_has_binding(ctx->current_scope, on)) {
+                        bool is_import = false;
+                        const CBMRegisteredFunc *f =
+                            ts_lookup_namespace_call(ctx, on, mname, args, &is_import);
+                        if (f) {
+                            ts_emit_resolved_call_at(ctx, f->qualified_name, "lsp_ts_namespace",
+                                                     0.95f, call_node);
+                            return;
+                        }
+                        if (is_import) {
+                            ts_emit_unresolved_call_at(
+                                ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", on, mname),
+                                "module_symbol_not_in_registry", call_node);
+                            return;
                         }
                     }
                 }
                 // Type-based dispatch.
                 const CBMType *recv = ts_eval_expr_type(ctx, obj);
-                const CBMRegisteredFunc *f = lookup_method(ctx, recv, mname);
-
-                // Overload resolution by arg types: when receiver is NAMED and the
-                // registry has multiple overloads (same receiver+name), eval each
-                // arg's type and let cbm_registry_lookup_method_by_types score them.
-                // Falls back to the first match if scoring fails.
-                if (f && recv) {
-                    const CBMType *base = simplify_type(ctx, recv);
-                    base = base ? unwrap_passthrough_template(base) : NULL;
-                    if (base && base->kind == CBM_TYPE_NAMED && base->data.named.qualified_name &&
-                        arg_count > 0) {
-                        const CBMType *arg_types[16] = {0};
-                        int n = arg_count > 16 ? 16 : arg_count;
-                        for (int i = 0; i < n; i++) {
-                            TSNode arg = ts_node_named_child(args, (uint32_t)i);
-                            arg_types[i] = ts_eval_expr_type(ctx, arg);
-                        }
-                        const CBMRegisteredFunc *better = cbm_registry_lookup_method_by_types(
-                            ctx->registry, base->data.named.qualified_name, mname, arg_types, n);
-                        if (better)
-                            f = better;
-                    }
-                }
+                const CBMRegisteredFunc *f = ts_lookup_method_for_call(ctx, recv, mname, args);
 
                 if (f) {
-                    ts_emit_resolved_call(ctx, f->qualified_name, "lsp_ts_method", 0.95f);
+                    ts_emit_resolved_call_at(ctx, f->qualified_name, "lsp_ts_method", 0.95f,
+                                             call_node);
                     return;
                 }
-                ts_emit_unresolved_call(ctx, mname, "method_not_in_registry");
+                ts_emit_unresolved_call_at(ctx, mname, "method_not_in_registry", call_node);
             }
         }
         return;
@@ -2350,31 +3049,14 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
         char *name = node_text(ctx, fn);
         if (!name)
             return;
+        if (ts_scope_has_binding(ctx->current_scope, name))
+            return;
 
-        // Eval arg types up-front for type-aware overload resolution.
-        const CBMType *arg_types[16] = {0};
-        int typed_arg_n = 0;
-        if (!ts_node_is_null(args) && arg_count > 0) {
-            typed_arg_n = arg_count > 16 ? 16 : arg_count;
-            for (int i = 0; i < typed_arg_n; i++) {
-                TSNode arg = ts_node_named_child(args, (uint32_t)i);
-                arg_types[i] = ts_eval_expr_type(ctx, arg);
-            }
-        }
-
-        // Module-local function: prefer by-types when args are typed.
+        // Module-local function: ordered argument types first, then arity.
         if (ctx->module_qn) {
-            const CBMRegisteredFunc *f = NULL;
-            if (typed_arg_n > 0) {
-                f = cbm_registry_lookup_symbol_by_types(ctx->registry, ctx->module_qn, name,
-                                                        arg_types, typed_arg_n);
-            }
-            if (!f) {
-                f = cbm_registry_lookup_symbol_by_args(ctx->registry, ctx->module_qn, name,
-                                                       arg_count);
-            }
+            const CBMRegisteredFunc *f = ts_lookup_symbol_for_call(ctx, ctx->module_qn, name, args);
             if (f) {
-                ts_emit_resolved_call(ctx, f->qualified_name, "lsp_ts_local", 0.95f);
+                ts_emit_resolved_call_at(ctx, f->qualified_name, "lsp_ts_local", 0.95f, call_node);
                 return;
             }
         }
@@ -2383,19 +3065,25 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
             const char *lname = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
             const char *mqn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
             if (lname && mqn && strcmp(lname, name) == 0) {
-                const CBMRegisteredFunc *f =
-                    cbm_registry_lookup_symbol_by_args(ctx->registry, mqn, name, arg_count);
+                const char *member = ts_import_export_name(ctx, name);
+                const CBMRegisteredFunc *f = ts_lookup_symbol_for_call(ctx, mqn, member, args);
+                if (f && member != name) {
+                    ts_emit_resolved_call_reason_at(ctx, f->qualified_name, "lsp_import_alias",
+                                                    0.95f, name, call_node);
+                    return;
+                }
                 if (f) {
-                    ts_emit_resolved_call(ctx, f->qualified_name, "lsp_ts_import", 0.95f);
+                    ts_emit_resolved_call_at(ctx, f->qualified_name, "lsp_ts_import", 0.95f,
+                                             call_node);
                     return;
                 }
                 // Fall through to qualified_name fallback.
-                const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, name);
-                ts_emit_unresolved_call(ctx, qn, "import_symbol_not_in_registry");
+                const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, member);
+                ts_emit_unresolved_call_at(ctx, qn, "import_symbol_not_in_registry", call_node);
                 return;
             }
         }
-        ts_emit_unresolved_call(ctx, name, "func_not_in_registry");
+        ts_emit_unresolved_call_at(ctx, name, "func_not_in_registry", call_node);
     }
 }
 
@@ -2694,12 +3382,19 @@ static void resolve_jsx_element(TSLSPContext *ctx, TSNode element_node) {
     if (tag_name[0] >= 'a' && tag_name[0] <= 'z')
         return;
 
+    /* Parameters and locals own the JSX identifier before module/import
+     * symbols.  They may still be callable at runtime, but without a graph
+     * node for that lexical value we must fail closed instead of redirecting
+     * the tag to a same-named component definition. */
+    if (ts_scope_has_binding(ctx->current_scope, tag_name))
+        return;
+
     // Resolve as a free-function/component call.
     if (ctx->module_qn) {
         const CBMRegisteredFunc *f =
             cbm_registry_lookup_symbol(ctx->registry, ctx->module_qn, tag_name);
         if (f) {
-            ts_emit_resolved_call(ctx, f->qualified_name, "lsp_ts_jsx", 0.95f);
+            ts_emit_resolved_call_at(ctx, f->qualified_name, "lsp_ts_jsx", 0.95f, tag);
             return;
         }
     }
@@ -2715,15 +3410,63 @@ static void resolve_jsx_element(TSLSPContext *ctx, TSNode element_node) {
              * real module QN and emits the correct resolution, so skip the per-file
              * emission for relative specifiers and let that one stand. */
             if (mqn[0] == '.') {
-                ts_emit_unresolved_call(ctx, tag_name, "jsx_import_unresolved_path");
+                ts_emit_unresolved_call_at(ctx, tag_name, "jsx_import_unresolved_path", tag);
                 return;
             }
-            const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, tag_name);
-            ts_emit_resolved_call(ctx, qn, "lsp_ts_jsx_import", 0.85f);
+            /* The import establishes lexical ownership, but a raw package or
+             * tsconfig-alias specifier is not a semantic target.  Require the
+             * current (per-file or cross-file overlay) registry to materialize
+             * the exact component before emitting CALLS.  An unresolved
+             * per-file row deliberately keeps the file eligible for the
+             * cross-file pass, where resolved import QNs and project defs are
+             * available. */
+            const char *member = ts_import_export_name(ctx, tag_name);
+            const CBMRegisteredFunc *f = cbm_registry_lookup_symbol(ctx->registry, mqn, member);
+            if (f && member != tag_name) {
+                ts_emit_resolved_call_reason_at(ctx, f->qualified_name, "lsp_import_alias", 0.95f,
+                                                tag_name, tag);
+                return;
+            }
+            if (f) {
+                ts_emit_resolved_call_at(ctx, f->qualified_name, "lsp_ts_jsx_import", 0.95f, tag);
+                return;
+            }
+            ts_emit_unresolved_call_at(ctx, tag_name, "jsx_component_not_in_registry", tag);
             return;
         }
     }
-    ts_emit_unresolved_call(ctx, tag_name, "jsx_component_not_in_registry");
+    ts_emit_unresolved_call_at(ctx, tag_name, "jsx_component_not_in_registry", tag);
+}
+
+/* Namespace members need the same function boundary handling as top-level
+ * declarations. Generic recursion can find their calls, but without setting
+ * enclosing_func_qn it cannot attribute those calls to the namespace member. */
+static void process_namespace_member(TSLSPContext *ctx, TSNode node) {
+    if (!ctx || ts_node_is_null(node))
+        return;
+
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "export_statement") == 0) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++)
+            process_namespace_member(ctx, ts_node_named_child(node, i));
+        return;
+    }
+
+    if (strcmp(kind, "function_declaration") == 0 && ctx->module_qn) {
+        TSNode name = ts_node_child_by_field_name(node, "name", TS_LSP_FIELD_LEN("name"));
+        if (!ts_node_is_null(name)) {
+            char *function_name = node_text(ctx, name);
+            if (function_name) {
+                const char *function_qn =
+                    cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, function_name);
+                process_function_body(ctx, node, function_qn, NULL);
+                return;
+            }
+        }
+    }
+
+    process_node(ctx, node);
 }
 
 static void process_node(TSLSPContext *ctx, TSNode node) {
@@ -2731,11 +3474,29 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
         return;
     const char *kind = ts_node_type(node);
 
+    /* A nested statement block owns `let`/`const` declarations. Function-body
+     * blocks are intentionally unwrapped by process_function_body(), so this
+     * branch applies only to nested lexical blocks and cannot hide parameters. */
+    if (strcmp(kind, "statement_block") == 0) {
+        CBMScope *saved = ctx->current_scope;
+        ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+        TSTreeCursor cursor = ts_tree_cursor_new(node);
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            do {
+                process_node(ctx, ts_tree_cursor_current_node(&cursor));
+            } while (ts_tree_cursor_goto_next_sibling(&cursor));
+        }
+        ts_tree_cursor_delete(&cursor);
+        ctx->current_scope = saved;
+        return;
+    }
+
     // Scope-affecting statements bind first, then we recurse.
     ts_process_statement(ctx, node);
 
     if (strcmp(kind, "call_expression") == 0) {
         resolve_call_at(ctx, node);
+        resolve_value_references_at(ctx, node);
 
         // Contextual callback typing: when an arg is an arrow_function and the
         // corresponding param of the called function is itself a FUNC, propagate the
@@ -2747,14 +3508,14 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
                 ts_node_child_by_field_name(node, "function", TS_LSP_FIELD_LEN("function"));
             if (ts_node_is_null(fn_node))
                 break;
-            const CBMType *fn_type = ts_eval_expr_type(ctx, fn_node);
-            if (!fn_type || fn_type->kind != CBM_TYPE_FUNC)
-                break;
-            if (!fn_type->data.func.param_types)
-                break;
             TSNode args =
                 ts_node_child_by_field_name(node, "arguments", TS_LSP_FIELD_LEN("arguments"));
             if (ts_node_is_null(args))
+                break;
+            const CBMType *fn_type = ts_signature_for_call(ctx, fn_node, args);
+            if (!fn_type || fn_type->kind != CBM_TYPE_FUNC)
+                break;
+            if (!fn_type->data.func.param_types)
                 break;
 
             // Process the function child for nested call resolution.
@@ -3008,6 +3769,26 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
         return;
     }
 
+    if (strcmp(kind, "internal_module") == 0) {
+        TSNode name = ts_node_child_by_field_name(node, "name", TS_LSP_FIELD_LEN("name"));
+        const char *saved_module_qn = ctx->module_qn;
+        if (!ts_node_is_null(name) && saved_module_qn) {
+            char *namespace_name = node_text(ctx, name);
+            if (namespace_name && namespace_name[0]) {
+                ctx->module_qn =
+                    cbm_arena_sprintf(ctx->arena, "%s.%s", saved_module_qn, namespace_name);
+            }
+        }
+        TSNode body = ts_node_child_by_field_name(node, "body", TS_LSP_FIELD_LEN("body"));
+        if (!ts_node_is_null(body)) {
+            uint32_t count = ts_node_named_child_count(body);
+            for (uint32_t i = 0; i < count; i++)
+                process_namespace_member(ctx, ts_node_named_child(body, i));
+        }
+        ctx->module_qn = saved_module_qn;
+        return;
+    }
+
     // Class / interface declarations are walked by the registry pass; here we just dive
     // into method_definition bodies for inner call resolution.
     if (strcmp(kind, "class_declaration") == 0) {
@@ -3124,6 +3905,30 @@ static void process_function_body(TSLSPContext *ctx, TSNode func_node, const cha
     ctx->current_scope = saved_scope;
 }
 
+static void process_top_level_variable_arrows(TSLSPContext *ctx, TSNode declaration) {
+    if (!ctx || ts_node_is_null(declaration) || !ctx->module_qn)
+        return;
+
+    uint32_t count = ts_node_named_child_count(declaration);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode declarator = ts_node_named_child(declaration, i);
+        if (!node_kind_is(declarator, "variable_declarator"))
+            continue;
+
+        TSNode name = ts_node_child_by_field_name(declarator, "name", TS_LSP_FIELD_LEN("name"));
+        TSNode value = ts_node_child_by_field_name(declarator, "value", TS_LSP_FIELD_LEN("value"));
+        if (!node_kind_is(name, "identifier") || !node_kind_is(value, "arrow_function"))
+            continue;
+
+        char *function_name = node_text(ctx, name);
+        if (!function_name)
+            continue;
+        const char *function_qn =
+            cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, function_name);
+        process_function_body(ctx, value, function_qn, NULL);
+    }
+}
+
 void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
     if (!ctx || ts_node_is_null(root))
         return;
@@ -3149,7 +3954,9 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
         TSNode child = kids[i];
         const char *kind = ts_node_type(child);
 
-        if (strcmp(kind, "function_declaration") == 0) {
+        if (strcmp(kind, "lexical_declaration") == 0 || strcmp(kind, "variable_declaration") == 0) {
+            process_top_level_variable_arrows(ctx, child);
+        } else if (strcmp(kind, "function_declaration") == 0) {
             TSNode name = ts_node_child_by_field_name(child, "name", TS_LSP_FIELD_LEN("name"));
             if (ts_node_is_null(name) || !ctx->module_qn)
                 continue;
@@ -3158,8 +3965,18 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
                 continue;
             const char *fqn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, fn);
             process_function_body(ctx, child, fqn, NULL);
-        } else if (strcmp(kind, "class_declaration") == 0) {
+        } else if (strcmp(kind, "class_declaration") == 0 || strcmp(kind, "internal_module") == 0) {
             process_node(ctx, child);
+        } else if (strcmp(kind, "expression_statement") == 0) {
+            /* tree-sitter-typescript wraps a namespace declaration in an
+             * expression_statement. Unwrap only that declaration shape;
+             * ordinary top-level expressions are not owned by a function. */
+            uint32_t count = ts_node_named_child_count(child);
+            for (uint32_t j = 0; j < count; j++) {
+                TSNode inner = ts_node_named_child(child, j);
+                if (node_kind_is(inner, "internal_module"))
+                    process_node(ctx, inner);
+            }
         } else if (strcmp(kind, "export_statement") == 0) {
             // Walk the wrapped declaration.
             uint32_t enc = ts_node_named_child_count(child);
@@ -3178,12 +3995,16 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
                         continue;
                     const char *fqn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, fn);
                     process_function_body(ctx, inner, fqn, NULL);
-                } else if (strcmp(ik, "class_declaration") == 0) {
+                } else if (strcmp(ik, "lexical_declaration") == 0 ||
+                           strcmp(ik, "variable_declaration") == 0) {
+                    process_top_level_variable_arrows(ctx, inner);
+                } else if (strcmp(ik, "class_declaration") == 0 ||
+                           strcmp(ik, "internal_module") == 0) {
                     process_node(ctx, inner);
                 }
             }
         }
-        // Top-level expression_statement bodies are not graphed as functions; skip.
+        // Other top-level expression_statement bodies are not graphed as functions.
     }
 }
 
@@ -3194,6 +4015,11 @@ void ts_lsp_init(TSLSPContext *ctx, CBMArena *arena, const char *source, int sou
                  bool jsx_mode, bool dts_mode, CBMResolvedCallArray *out) {
     if (!ctx)
         return;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    g_ts_signature_lookup_work = 0;
+    g_ts_max_member_lookup_steps = 0;
+    g_ts_max_method_lookup_steps = 0;
+#endif
     memset(ctx, 0, sizeof(TSLSPContext));
     ctx->arena = arena;
     ctx->source = source;
@@ -3229,6 +4055,68 @@ void ts_lsp_add_import(TSLSPContext *ctx, const char *local_name, const char *mo
     ctx->import_local_names = names;
     ctx->import_module_qns = qns;
     ctx->import_count = new_count;
+}
+
+static void ts_lsp_add_import_alias(TSLSPContext *ctx, const char *local, const char *exported) {
+    if ((size_t)ctx->import_alias_count == ctx->import_alias_capacity) {
+        /* The arena retains old arrays: grow geometrically so collecting A
+         * aliases retains O(A) pointers instead of O(A squared). */
+        size_t capacity = ctx->import_alias_capacity ? ctx->import_alias_capacity * 2 : 8;
+        const char **locals =
+            (const char **)cbm_arena_alloc(ctx->arena, capacity * sizeof(const char *));
+        const char **exports =
+            (const char **)cbm_arena_alloc(ctx->arena, capacity * sizeof(const char *));
+        if (!locals || !exports)
+            return;
+        for (int i = 0; i < ctx->import_alias_count; i++) {
+            locals[i] = ctx->import_alias_locals[i];
+            exports[i] = ctx->import_alias_exports[i];
+        }
+        ctx->import_alias_locals = locals;
+        ctx->import_alias_exports = exports;
+        ctx->import_alias_capacity = capacity;
+    }
+    ctx->import_alias_locals[ctx->import_alias_count] = local;
+    ctx->import_alias_exports[ctx->import_alias_count] = exported;
+    ctx->import_alias_count++;
+}
+
+/* Record each `import { foo as bar }` binding of the file (#2297). The import
+ * map holds only local bindings, so a renamed binding spelled `<module>.bar`,
+ * named nothing, and every call through it lost its CALLS edge. Reading the
+ * file's own import statements serves the per-file and both cross-file entry
+ * points alike. `default as x` keeps today's local-name lookup (a default
+ * import binds no exported member name); string export names and identity
+ * aliases need no entry. Must run before the type passes, which resolve
+ * imported type names. */
+static void ts_lsp_collect_import_aliases(TSLSPContext *ctx, TSNode root) {
+    if (!ctx || !ctx->arena || ts_node_is_null(root) || ctx->import_count == 0)
+        return;
+    uint32_t kn = 0;
+    TSNode *kids = collect_children(ctx->arena, root, &kn);
+    for (uint32_t i = 0; i < kn; i++) {
+        if (!node_kind_is(kids[i], "import_statement"))
+            continue;
+        TSNode named = find_first_kind(find_first_kind(kids[i], "import_clause"), "named_imports");
+        if (ts_node_is_null(named))
+            continue;
+        uint32_t sn = 0;
+        TSNode *specs = collect_children(ctx->arena, named, &sn);
+        for (uint32_t j = 0; j < sn; j++) {
+            if (!node_kind_is(specs[j], "import_specifier"))
+                continue;
+            TSNode name = ts_node_child_by_field_name(specs[j], "name", TS_LSP_FIELD_LEN("name"));
+            TSNode alias =
+                ts_node_child_by_field_name(specs[j], "alias", TS_LSP_FIELD_LEN("alias"));
+            if (!node_kind_is(name, "identifier") || !node_kind_is(alias, "identifier"))
+                continue;
+            char *exported = node_text(ctx, name);
+            char *local = node_text(ctx, alias);
+            if (exported && local && strcmp(exported, "default") != 0 &&
+                strcmp(exported, local) != 0)
+                ts_lsp_add_import_alias(ctx, local, exported);
+        }
+    }
 }
 
 // ── Stdlib seeds (Phase 5 will replace with generator) ────────────────────────
@@ -3957,8 +4845,23 @@ static void register_file_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMFileRes
                     }
                 }
             }
-            const CBMType **params_t = parse_param_types_array(arena, d->param_types, module_qn);
-            rf.signature = cbm_type_func(arena, d->param_names, params_t, rets);
+            /* The counted occurrence-preserving carrier wins even when its
+             * explicit count is zero. Legacy names are only safe alongside the
+             * legacy fallback because the two legacy projections share shape. */
+            bool has_ordered_params =
+                d->signature_param_types != NULL || d->signature_param_count > 0;
+            const CBMType **params_t = NULL;
+            const char **param_names = NULL;
+            if (has_ordered_params) {
+                CBMTSLSPSignatureParserContext param_parser_ctx = {module_qn};
+                params_t = cbm_type_materialize_signature_params(
+                    arena, d->signature_param_types, d->signature_param_count,
+                    cbm_ts_lsp_parse_signature_param_text, &param_parser_ctx);
+            } else {
+                params_t = parse_param_types_array(arena, d->param_types, module_qn);
+                param_names = d->param_names;
+            }
+            rf.signature = cbm_type_func(arena, param_names, params_t, rets);
 
             // Methods: deduce receiver from QN ("module.Class.method" → receiver "module.Class").
             if (strcmp(d->label, "Method") == 0) {
@@ -4025,16 +4928,77 @@ static void register_file_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMFileRes
     }
 }
 
-// Find the first `return EXPR` inside a body and evaluate EXPR's type. Returns
-// UNKNOWN if the body has no return or every return is unresolvable.
+// AST walk stacks for the passes below. The first chunk lives on the C stack, the
+// same 256 slots the old fixed arrays used; a wider pending set grows on the heap
+// through cbm_walk_stack_reserve and is released when the walk ends, so nothing
+// is cut from the per-file result arena. A fixed cap used to stop pushing without
+// a word, which skipped every top-level declaration past the 256th and left the
+// return walk short of returns it had never reached (#2388).
+enum { TS_WALK_STACK_INLINE = 256 };
+
+static int ts_walk_pending_count(int top, uint32_t count, const char *walker) {
+    if (top < 0 || count > (uint32_t)(INT_MAX - top)) {
+        char pending[24];
+        snprintf(pending, sizeof(pending), "%llu", (unsigned long long)count + (unsigned)top);
+        cbm_log_error("extract.walk_stack_alloc_failed", "walker", walker, "pending", pending);
+        return -1;
+    }
+    return top + (int)count;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+int cbm_ts_lsp_test_walk_pending_count(int top, uint32_t count) {
+    return ts_walk_pending_count(top, count, "ts_lsp_test");
+}
+#endif
+
+// Push every child of n in cursor order (one O(N) pass). The walk pops the stack,
+// so children are visited last-child first: the order these walks have always
+// used. False means the stack could not grow; cbm_walk_stack_reserve has logged it.
+static bool ts_walk_push_children(TSNode **stack, int *cap, int *top, TSNode n,
+                                  const TSNode *inline_buf, const char *walker) {
+    uint32_t count = ts_node_child_count(n);
+    if (count == 0)
+        return true;
+    int need = ts_walk_pending_count(*top, count, walker);
+    if (need < 0 ||
+        !cbm_walk_stack_reserve((void **)stack, cap, need, sizeof(TSNode), inline_buf, walker))
+        return false;
+    TSTreeCursor cursor = ts_tree_cursor_new(n);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        uint32_t pushed = 0;
+        do {
+            (*stack)[(*top)++] = ts_tree_cursor_current_node(&cursor);
+            pushed++;
+        } while (pushed < count && ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return true;
+}
+
+static bool ts_walk_push(TSNode **stack, int *cap, int *top, TSNode n, const TSNode *inline_buf,
+                         const char *walker) {
+    int need = ts_walk_pending_count(*top, 1, walker);
+    if (need < 0 ||
+        !cbm_walk_stack_reserve((void **)stack, cap, need, sizeof(TSNode), inline_buf, walker))
+        return false;
+    (*stack)[(*top)++] = n;
+    return true;
+}
+
+// Find a `return EXPR` inside a body and evaluate EXPR's type. Children are visited
+// last-child first, so of several returns the one latest in the body is tried
+// first; the first one that resolves wins. Returns UNKNOWN if the body has no
+// return, every return is unresolvable, or the walk stack could not grow.
 static const CBMType *infer_return_type_from_body(TSLSPContext *ctx, TSNode body) {
     if (ts_node_is_null(body))
         return cbm_type_unknown();
 
-    // Iterative DFS using a small fixed-size stack to avoid C-stack blowup on big bodies.
-    enum { STACK_CAP = 256 };
-    TSNode stack[STACK_CAP];
+    TSNode inline_stack[TS_WALK_STACK_INLINE];
+    TSNode *stack = inline_stack;
+    int cap = TS_WALK_STACK_INLINE;
     int top = 0;
+    const CBMType *found = cbm_type_unknown();
     stack[top++] = body;
     while (top > 0) {
         TSNode n = stack[--top];
@@ -4050,8 +5014,10 @@ static const CBMType *infer_return_type_from_body(TSLSPContext *ctx, TSNode body
             if (ts_node_is_null(expr))
                 continue;
             const CBMType *t = ts_eval_expr_type(ctx, expr);
-            if (t && !cbm_type_is_unknown(t))
-                return t;
+            if (t && !cbm_type_is_unknown(t)) {
+                found = t;
+                break;
+            }
             continue;
         }
         // Don't recurse into nested function bodies — their returns belong to them.
@@ -4059,13 +5025,95 @@ static const CBMType *infer_return_type_from_body(TSLSPContext *ctx, TSNode body
             strcmp(k, "arrow_function") == 0 || strcmp(k, "method_definition") == 0)
             continue;
 
-        uint32_t cnt = ts_node_child_count(n);
-        for (uint32_t i = 0; i < cnt && top < STACK_CAP; i++) {
-            stack[top++] = ts_node_child(n, i);
-        }
+        if (!ts_walk_push_children(&stack, &cap, &top, n, inline_stack, "ts_lsp_return_walk"))
+            break; // "unknown" is the safe answer for a walk that could not finish
     }
-    return cbm_type_unknown();
+    cbm_walk_stack_release(stack, inline_stack);
+    return found;
 }
+
+// These two AST passes patch the FIRST matching local registration, even when
+// the general registry index prefers the last duplicate. Do not follow fallback
+// or copy its entries into the overlay. The snapshot lives only across these
+// passes, which mutate signatures but never append or rename registered funcs.
+typedef struct {
+    CBMRegisteredFunc **slots;
+    size_t capacity;
+} TSSignatureIndex;
+
+static void ts_signature_work(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    g_ts_signature_lookup_work++;
+#endif
+}
+
+static size_t ts_signature_slot(const TSSignatureIndex *index, const char *qn) {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    for (const unsigned char *p = (const unsigned char *)qn; *p; p++) {
+        hash ^= *p;
+        hash *= 0x100000001b3ULL;
+    }
+    size_t slot = (size_t)hash & (index->capacity - 1);
+    for (;;) {
+        ts_signature_work();
+        if (!index->slots[slot] || strcmp(index->slots[slot]->qualified_name, qn) == 0)
+            return slot;
+        slot = (slot + 1) & (index->capacity - 1);
+    }
+}
+
+static TSSignatureIndex ts_signature_index(CBMTypeRegistry *reg) {
+    TSSignatureIndex index = {0};
+    if (reg->func_count <= 0 || (size_t)reg->func_count > SIZE_MAX / 2)
+        return index;
+    size_t capacity = 16;
+    while (capacity < (size_t)reg->func_count * 2) {
+        if (capacity > SIZE_MAX / 2)
+            return index;
+        capacity *= 2;
+    }
+    if (capacity > SIZE_MAX / sizeof(*index.slots))
+        return index;
+    index.slots = cbm_alloc(CBM_MEM_CLASS_EXTRACT, capacity * sizeof(*index.slots));
+    if (!index.slots)
+        return index; // Preserve the original lookup on allocation failure.
+    index.capacity = capacity;
+    memset(index.slots, 0, capacity * sizeof(*index.slots));
+    for (int i = 0; i < reg->func_count; i++) {
+        ts_signature_work();
+        CBMRegisteredFunc *func = &reg->funcs[i];
+        if (!func->qualified_name)
+            continue;
+        size_t slot = ts_signature_slot(&index, func->qualified_name);
+        if (!index.slots[slot])
+            index.slots[slot] = func;
+    }
+    return index;
+}
+
+static CBMRegisteredFunc *ts_signature_func(CBMTypeRegistry *reg, const TSSignatureIndex *index,
+                                            const char *qn) {
+    if (!qn)
+        return NULL;
+    if (index->slots)
+        return index->slots[ts_signature_slot(index, qn)];
+    for (int i = 0; i < reg->func_count; i++) {
+        ts_signature_work();
+        if (reg->funcs[i].qualified_name && strcmp(reg->funcs[i].qualified_name, qn) == 0)
+            return &reg->funcs[i];
+    }
+    return NULL;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+int cbm_ts_lsp_test_signature_func_index(CBMTypeRegistry *reg, const char *qn) {
+    TSSignatureIndex index = ts_signature_index(reg);
+    CBMRegisteredFunc *func = ts_signature_func(reg, &index, qn);
+    int result = func ? (int)(func - reg->funcs) : -1;
+    cbm_free(CBM_MEM_CLASS_EXTRACT, index.slots);
+    return result;
+}
+#endif
 
 // Rebuild a function's CBMRegisteredFunc signature from the AST directly. extract_defs
 // only handles type_identifier / generic_type / predefined_type for params, so function
@@ -4074,18 +5122,22 @@ static const CBMType *infer_return_type_from_body(TSLSPContext *ctx, TSNode body
 //
 // Called after `register_file_defs` so the func entries already exist; we only mutate
 // in place.
-static void rebuild_signatures_from_ast(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *reg) {
+static void rebuild_signatures_from_ast(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *reg,
+                                        const TSSignatureIndex *index) {
     if (ts_node_is_null(root) || !reg || !ctx->module_qn)
         return;
 
-    enum { STACK_CAP = 256 };
-    TSNode stack[STACK_CAP];
+    // Seeded with every top-level child, so a file with more than 256 of them
+    // needs the growing stack (see TS_WALK_STACK_INLINE). If it cannot grow, the
+    // walk stops and the declarations not yet reached keep extract_defs' signature.
+    TSNode inline_stack[TS_WALK_STACK_INLINE];
+    TSNode *stack = inline_stack;
+    int cap = TS_WALK_STACK_INLINE;
     int top = 0;
-    uint32_t nc = ts_node_child_count(root);
-    for (uint32_t i = 0; i < nc && top < STACK_CAP; i++)
-        stack[top++] = ts_node_child(root, i);
+    bool walking =
+        ts_walk_push_children(&stack, &cap, &top, root, inline_stack, "ts_lsp_rebuild_signatures");
 
-    while (top > 0) {
+    while (walking && top > 0) {
         TSNode n = stack[--top];
         if (ts_node_is_null(n))
             continue;
@@ -4093,16 +5145,15 @@ static void rebuild_signatures_from_ast(TSLSPContext *ctx, TSNode root, CBMTypeR
 
         // Recurse into export_statement and class bodies.
         if (strcmp(k, "export_statement") == 0 || strcmp(k, "class_body") == 0) {
-            uint32_t cnt = ts_node_child_count(n);
-            for (uint32_t i = 0; i < cnt && top < STACK_CAP; i++) {
-                stack[top++] = ts_node_child(n, i);
-            }
+            walking = ts_walk_push_children(&stack, &cap, &top, n, inline_stack,
+                                            "ts_lsp_rebuild_signatures");
             continue;
         }
         if (strcmp(k, "class_declaration") == 0) {
             TSNode body = ts_node_child_by_field_name(n, "body", TS_LSP_FIELD_LEN("body"));
-            if (!ts_node_is_null(body) && top < STACK_CAP)
-                stack[top++] = body;
+            if (!ts_node_is_null(body))
+                walking = ts_walk_push(&stack, &cap, &top, body, inline_stack,
+                                       "ts_lsp_rebuild_signatures");
             continue;
         }
 
@@ -4213,43 +5264,42 @@ static void rebuild_signatures_from_ast(TSLSPContext *ctx, TSNode root, CBMTypeR
         // Build new signature and patch in registry.
         const CBMType *rets[2] = {ret, NULL};
         const CBMType *new_sig = cbm_type_func(ctx->arena, p_names, p_types, rets);
-        for (int fi = 0; fi < reg->func_count; fi++) {
-            if (!reg->funcs[fi].qualified_name)
-                continue;
-            if (strcmp(reg->funcs[fi].qualified_name, fqn) != 0)
-                continue;
+        CBMRegisteredFunc *func = ts_signature_func(reg, index, fqn);
+        if (func) {
             // Preserve the ret type if AST gave UNKNOWN but the existing reg sig had one.
-            if (cbm_type_is_unknown(ret) && reg->funcs[fi].signature &&
-                reg->funcs[fi].signature->kind == CBM_TYPE_FUNC &&
-                reg->funcs[fi].signature->data.func.return_types &&
-                reg->funcs[fi].signature->data.func.return_types[0] &&
-                !cbm_type_is_unknown(reg->funcs[fi].signature->data.func.return_types[0])) {
-                const CBMType *preserved[2] = {reg->funcs[fi].signature->data.func.return_types[0],
-                                               NULL};
+            if (cbm_type_is_unknown(ret) && func->signature &&
+                func->signature->kind == CBM_TYPE_FUNC && func->signature->data.func.return_types &&
+                func->signature->data.func.return_types[0] &&
+                !cbm_type_is_unknown(func->signature->data.func.return_types[0])) {
+                const CBMType *preserved[2] = {func->signature->data.func.return_types[0], NULL};
                 new_sig = cbm_type_func(ctx->arena, p_names, p_types, preserved);
             }
-            reg->funcs[fi].signature = new_sig;
-            break;
+            func->signature = new_sig;
         }
     }
+    cbm_walk_stack_release(stack, inline_stack);
 }
 
 // Convert NAMED references to TYPE_PARAM for any function whose declaration has a
 // `type_parameters` block. Without this, generic functions like `function id<T>(x: T): T`
 // register T as NAMED("module.T") instead of TYPE_PARAM("T"), defeating substitution.
-static void convert_signature_type_params(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *reg) {
+static void convert_signature_type_params(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *reg,
+                                          const TSSignatureIndex *index) {
     if (ts_node_is_null(root) || !reg || !ctx->module_qn)
         return;
 
     // Walk: function_declaration, class_declaration { method_definition }, plus exported.
-    enum { STACK_CAP = 256 };
-    TSNode stack[STACK_CAP];
+    // Seeded with every top-level child, so a file with more than 256 of them needs
+    // the growing stack (see TS_WALK_STACK_INLINE). If it cannot grow, the walk stops
+    // and the generics not yet reached keep their NAMED parameters.
+    TSNode inline_stack[TS_WALK_STACK_INLINE];
+    TSNode *stack = inline_stack;
+    int cap = TS_WALK_STACK_INLINE;
     int top = 0;
-    uint32_t nc = ts_node_child_count(root);
-    for (uint32_t i = 0; i < nc && top < STACK_CAP; i++)
-        stack[top++] = ts_node_child(root, i);
+    bool walking =
+        ts_walk_push_children(&stack, &cap, &top, root, inline_stack, "ts_lsp_type_params");
 
-    while (top > 0) {
+    while (walking && top > 0) {
         TSNode n = stack[--top];
         if (ts_node_is_null(n))
             continue;
@@ -4257,16 +5307,15 @@ static void convert_signature_type_params(TSLSPContext *ctx, TSNode root, CBMTyp
 
         // Recurse into export_statement and class_body.
         if (strcmp(k, "export_statement") == 0 || strcmp(k, "class_body") == 0) {
-            uint32_t cnt = ts_node_child_count(n);
-            for (uint32_t i = 0; i < cnt && top < STACK_CAP; i++) {
-                stack[top++] = ts_node_child(n, i);
-            }
+            walking =
+                ts_walk_push_children(&stack, &cap, &top, n, inline_stack, "ts_lsp_type_params");
             continue;
         }
         if (strcmp(k, "class_declaration") == 0) {
             TSNode body = ts_node_child_by_field_name(n, "body", TS_LSP_FIELD_LEN("body"));
-            if (!ts_node_is_null(body) && top < STACK_CAP)
-                stack[top++] = body;
+            if (!ts_node_is_null(body))
+                walking =
+                    ts_walk_push(&stack, &cap, &top, body, inline_stack, "ts_lsp_type_params");
             continue;
         }
 
@@ -4342,17 +5391,14 @@ static void convert_signature_type_params(TSLSPContext *ctx, TSNode root, CBMTyp
         }
 
         // Patch the registered func's signature: rewrite NAMED → TYPE_PARAM.
-        for (int fi = 0; fi < reg->func_count; fi++) {
-            if (!reg->funcs[fi].qualified_name)
-                continue;
-            if (strcmp(reg->funcs[fi].qualified_name, fqn) != 0)
-                continue;
-            const CBMType *old_sig = reg->funcs[fi].signature;
+        CBMRegisteredFunc *func = ts_signature_func(reg, index, fqn);
+        if (func) {
+            const CBMType *old_sig = func->signature;
             if (!old_sig)
-                break;
+                continue;
             const CBMType *new_sig = cbm_type_substitute(ctx->arena, old_sig, names, args);
             if (new_sig)
-                reg->funcs[fi].signature = new_sig;
+                func->signature = new_sig;
             // Also store the type_param_names for later overload-by-types use.
             const char **stored = (const char **)cbm_arena_alloc(
                 ctx->arena, (size_t)(tpc + 1) * sizeof(const char *));
@@ -4360,11 +5406,20 @@ static void convert_signature_type_params(TSLSPContext *ctx, TSNode root, CBMTyp
                 for (int ti = 0; ti < tpc; ti++)
                     stored[ti] = names[ti];
                 stored[tpc] = NULL;
-                reg->funcs[fi].type_param_names = stored;
+                func->type_param_names = stored;
             }
-            break;
         }
     }
+    cbm_walk_stack_release(stack, inline_stack);
+}
+
+// Build once after shape registration, then release before later passes may
+// grow the registry. This keeps per-file lookup storage out of the result arena.
+static void refine_ast_signatures(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *reg) {
+    TSSignatureIndex index = ts_signature_index(reg);
+    rebuild_signatures_from_ast(ctx, root, reg, &index);
+    convert_signature_type_params(ctx, root, reg, &index);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, index.slots);
 }
 
 // Parse a JSDoc comment block for `@param {T} name` and `@returns {T}` tags. For each
@@ -4624,6 +5679,157 @@ static void infer_implicit_returns(TSLSPContext *ctx, TSNode root, CBMTypeRegist
     }
 }
 
+/* Interface methods are synthesized after definition extraction and therefore
+ * cannot consume the CBMLSPDef ordered carrier.  Build their FUNC type from the
+ * AST without matching by QN (overloads intentionally share a QN). */
+static const CBMType *interface_method_signature_from_ast(TSLSPContext *ctx, TSNode method,
+                                                          int *out_min_params) {
+    const CBMType *param_types[32] = {0};
+    int param_count = 0;
+    int min_params = 0;
+    TSNode params =
+        ts_node_child_by_field_name(method, "parameters", TS_LSP_FIELD_LEN("parameters"));
+    if (!ts_node_is_null(params)) {
+        uint32_t count = ts_node_named_child_count(params);
+        for (uint32_t i = 0; i < count && param_count < 31; i++) {
+            TSNode param = ts_node_named_child(params, i);
+            const char *kind = ts_node_type(param);
+            if (strcmp(kind, "required_parameter") != 0 &&
+                strcmp(kind, "optional_parameter") != 0) {
+                continue;
+            }
+
+            TSNode pattern =
+                ts_node_child_by_field_name(param, "pattern", TS_LSP_FIELD_LEN("pattern"));
+            if (ts_node_is_null(pattern)) {
+                pattern = ts_node_child_by_field_name(param, "name", TS_LSP_FIELD_LEN("name"));
+            }
+            if (!ts_node_is_null(pattern)) {
+                char *name = node_text(ctx, pattern);
+                if (name && strcmp(name, "this") == 0)
+                    continue;
+            }
+
+            const CBMType *param_type = cbm_type_unknown();
+            TSNode annotation =
+                ts_node_child_by_field_name(param, "type", TS_LSP_FIELD_LEN("type"));
+            if (ts_node_is_null(annotation)) {
+                uint32_t child_count = ts_node_named_child_count(param);
+                for (uint32_t j = 0; j < child_count; j++) {
+                    TSNode child = ts_node_named_child(param, j);
+                    if (strcmp(ts_node_type(child), "type_annotation") == 0) {
+                        annotation = child;
+                        break;
+                    }
+                }
+            }
+            if (!ts_node_is_null(annotation)) {
+                TSNode type_node = strcmp(ts_node_type(annotation), "type_annotation") == 0
+                                       ? ts_node_named_child(annotation, 0)
+                                       : annotation;
+                if (!ts_node_is_null(type_node))
+                    param_type = ts_parse_type_node(ctx, type_node);
+            }
+            param_types[param_count++] = param_type;
+
+            if (strcmp(kind, "required_parameter") == 0) {
+                TSNode value =
+                    ts_node_child_by_field_name(param, "value", TS_LSP_FIELD_LEN("value"));
+                bool rest =
+                    !ts_node_is_null(pattern) && strcmp(ts_node_type(pattern), "rest_pattern") == 0;
+                if (ts_node_is_null(value) && !rest)
+                    min_params++;
+            }
+        }
+    }
+    param_types[param_count] = NULL;
+
+    const CBMType *return_type = cbm_type_unknown();
+    TSNode return_node =
+        ts_node_child_by_field_name(method, "return_type", TS_LSP_FIELD_LEN("return_type"));
+    if (!ts_node_is_null(return_node)) {
+        TSNode type_node = strcmp(ts_node_type(return_node), "type_annotation") == 0
+                               ? ts_node_named_child(return_node, 0)
+                               : return_node;
+        if (!ts_node_is_null(type_node))
+            return_type = ts_parse_type_node(ctx, type_node);
+    }
+    const CBMType *return_types[2] = {return_type, NULL};
+    if (out_min_params)
+        *out_min_params = min_params;
+    return cbm_type_func(ctx->arena, NULL, param_count ? param_types : NULL, return_types);
+}
+
+/* Parsed type of a `type_annotation` field (`: T`), or unknown. */
+static const CBMType *ts_annotation_field_type(TSLSPContext *ctx, TSNode owner) {
+    TSNode tann = ts_node_child_by_field_name(owner, "type", TS_LSP_FIELD_LEN("type"));
+    if (ts_node_is_null(tann))
+        return cbm_type_unknown();
+    TSNode tn =
+        strcmp(ts_node_type(tann), "type_annotation") == 0 ? ts_node_named_child(tann, 0) : tann;
+    return ts_node_is_null(tn) ? cbm_type_unknown() : ts_parse_type_node(ctx, tn);
+}
+
+/* Declared type of a class field (`public_field_definition`) or interface
+ * property: the annotation when present, else, for an unannotated field
+ * initialised with `new C()`, the type of that instance (#514). No other
+ * initializer is inferred: `new` names its type exactly, arbitrary
+ * expressions do not. */
+static const CBMType *ts_field_decl_type(TSLSPContext *ctx, TSNode m) {
+    if (!ts_node_is_null(ts_node_child_by_field_name(m, "type", TS_LSP_FIELD_LEN("type"))))
+        return ts_annotation_field_type(ctx, m);
+    TSNode val = ts_node_child_by_field_name(m, "value", TS_LSP_FIELD_LEN("value"));
+    if (ts_node_is_null(val) || strcmp(ts_node_type(val), "new_expression") != 0)
+        return cbm_type_unknown();
+    const CBMType *nt = ts_new_expression_type(ctx, val);
+    return nt ? nt : cbm_type_unknown();
+}
+
+/* A constructor parameter is a TS parameter property, i.e. also declares a
+ * class field, iff it carries an accessibility modifier, `readonly` or
+ * `override`. */
+static bool ts_param_is_property(TSNode p) {
+    uint32_t pc = ts_node_child_count(p);
+    for (uint32_t ci = 0; ci < pc; ci++) {
+        const char *ck = ts_node_type(ts_node_child(p, ci));
+        if (strcmp(ck, "accessibility_modifier") == 0 || strcmp(ck, "readonly") == 0 ||
+            strcmp(ck, "override_modifier") == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Append the parameter properties of a `constructor` method_definition to
+ * the field arrays (#514): `constructor(private readonly svc: Svc)` declares
+ * field `svc: Svc`, the dominant NestJS injection shape. Any other member is
+ * ignored. Returns the new field count. */
+static int ts_collect_param_properties(TSLSPContext *ctx, TSNode m, const char **names,
+                                       const CBMType **types, int count, int cap) {
+    TSNode mname = ts_node_child_by_field_name(m, "name", TS_LSP_FIELD_LEN("name"));
+    char *mnm = ts_node_is_null(mname) ? NULL : node_text(ctx, mname);
+    if (!mnm || strcmp(mnm, "constructor") != 0)
+        return count;
+    TSNode params = ts_node_child_by_field_name(m, "parameters", TS_LSP_FIELD_LEN("parameters"));
+    uint32_t pnc = ts_node_is_null(params) ? 0 : ts_node_named_child_count(params);
+    for (uint32_t pi = 0; pi < pnc && count < cap; pi++) {
+        TSNode p = ts_node_named_child(params, pi);
+        const char *pk = ts_node_type(p);
+        if ((strcmp(pk, "required_parameter") != 0 && strcmp(pk, "optional_parameter") != 0) ||
+            !ts_param_is_property(p))
+            continue;
+        TSNode pat = ts_node_child_by_field_name(p, "pattern", TS_LSP_FIELD_LEN("pattern"));
+        if (ts_node_is_null(pat) || strcmp(ts_node_type(pat), "identifier") != 0)
+            continue;
+        char *pnm = node_text(ctx, pat);
+        if (!pnm)
+            continue;
+        names[count] = pnm;
+        types[count] = ts_annotation_field_type(ctx, p);
+        count++;
+    }
+    return count;
+}
+
 // AST sweep: walk class/interface bodies to collect field names+types and refine
 // embedded_types / type_param_names.
 static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *reg) {
@@ -4736,21 +5942,21 @@ static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *re
             if (strcmp(mk, "public_field_definition") == 0 ||
                 strcmp(mk, "property_signature") == 0) {
                 TSNode fname = ts_node_child_by_field_name(m, "name", TS_LSP_FIELD_LEN("name"));
-                TSNode ftype = ts_node_child_by_field_name(m, "type", TS_LSP_FIELD_LEN("type"));
                 if (ts_node_is_null(fname))
                     continue;
                 char *fnm = node_text(ctx, fname);
                 if (!fnm)
                     continue;
-                const CBMType *ft = cbm_type_unknown();
-                if (!ts_node_is_null(ftype)) {
-                    TSNode tch = ts_node_named_child(ftype, 0);
-                    if (!ts_node_is_null(tch))
-                        ft = ts_parse_type_node(ctx, tch);
-                }
                 field_names[field_count] = fnm;
-                field_types[field_count] = ft;
+                field_types[field_count] = ts_field_decl_type(ctx, m);
                 field_count++;
+                continue;
+            }
+
+            // Constructor parameter properties are class fields too (#514).
+            if (!is_interface && strcmp(mk, "method_definition") == 0) {
+                field_count =
+                    ts_collect_param_properties(ctx, m, field_names, field_types, field_count, 63);
                 continue;
             }
 
@@ -4766,19 +5972,8 @@ static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *re
                 if (!mnm)
                     continue;
 
-                // Return type via field "return_type" — it's a type_annotation node.
-                const CBMType *ret = cbm_type_unknown();
-                TSNode rt_node =
-                    ts_node_child_by_field_name(m, "return_type", TS_LSP_FIELD_LEN("return_type"));
-                if (!ts_node_is_null(rt_node)) {
-                    TSNode tch = (strcmp(ts_node_type(rt_node), "type_annotation") == 0)
-                                     ? ts_node_named_child(rt_node, 0)
-                                     : rt_node;
-                    if (!ts_node_is_null(tch))
-                        ret = ts_parse_type_node(ctx, tch);
-                }
-                const CBMType *rets[2] = {ret, NULL};
-                const CBMType *sig = cbm_type_func(ctx->arena, NULL, NULL, rets);
+                int min_params = -1;
+                const CBMType *sig = interface_method_signature_from_ast(ctx, m, &min_params);
 
                 const char *mqn = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, mnm);
                 iface_method_names[iface_method_count] = mnm;
@@ -4793,7 +5988,7 @@ static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *re
                 rf.short_name = mnm;
                 rf.receiver_type = class_qn;
                 rf.signature = sig;
-                rf.min_params = -1;
+                rf.min_params = min_params;
                 cbm_registry_add_func(reg, rf);
             }
         }
@@ -4856,6 +6051,7 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     TSLSPContext ctx;
     ts_lsp_init(&ctx, arena, source, source_len, &reg, result->module_qn, js_mode, jsx_mode,
                 dts_mode, &result->resolved_calls);
+    ctx.usages = &result->usages;
 
     // Add imports early so type-resolution passes can rewrite NAMED references that
     // refer to imported symbols. ts_parse_type_node consults these via
@@ -4866,10 +6062,10 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
             ts_lsp_add_import(&ctx, imp->local_name, imp->module_path);
         }
     }
+    ts_lsp_collect_import_aliases(&ctx, root);
 
     ast_sweep_shapes(&ctx, root, &reg);
-    rebuild_signatures_from_ast(&ctx, root, &reg);
-    convert_signature_type_params(&ctx, root, &reg);
+    refine_ast_signatures(&ctx, root, &reg);
     apply_jsdoc_signatures(&ctx, root, &reg);
     infer_implicit_returns(&ctx, root, &reg);
 
@@ -4990,13 +6186,14 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
             rf.qualified_name = d->qualified_name;
             rf.short_name = d->short_name;
             rf.min_params = -1;
+            const CBMType **rets = NULL;
             if (d->return_types && d->return_types[0]) {
                 int n = 1;
                 for (const char *s = d->return_types; *s; s++)
                     if (*s == '|')
                         n++;
-                const CBMType **rets = (const CBMType **)cbm_arena_alloc(
-                    arena, (size_t)(n + 1) * sizeof(const CBMType *));
+                rets = (const CBMType **)cbm_arena_alloc(arena,
+                                                         (size_t)(n + 1) * sizeof(const CBMType *));
                 if (rets) {
                     int idx = 0;
                     const char *start = d->return_types;
@@ -5010,9 +6207,13 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
                         }
                     }
                     rets[idx] = NULL;
-                    rf.signature = cbm_type_func(arena, NULL, NULL, rets);
                 }
             }
+            CBMTSLSPSignatureParserContext param_parser_ctx = {d->def_module_qn};
+            const CBMType **params = cbm_type_materialize_signature_params(
+                arena, d->signature_param_types, d->signature_param_count,
+                cbm_ts_lsp_parse_signature_param_text, &param_parser_ctx);
+            rf.signature = cbm_type_func(arena, NULL, params, rets);
             if (strcmp(d->label, "Method") == 0 && d->receiver_type) {
                 rf.receiver_type = d->receiver_type;
             }
@@ -5091,7 +6292,7 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
             jsx_mode ? (js_mode ? tree_sitter_javascript() : tree_sitter_tsx())
                      : (js_mode ? tree_sitter_javascript() : tree_sitter_typescript());
         ts_parser_set_language(parser, lang);
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         ts_parser_delete(parser);
         if (!tree)
             return;
@@ -5109,15 +6310,16 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
     TSLSPContext ctx;
     ts_lsp_init(&ctx, arena, source, source_len, &overlay, module_qn, js_mode, jsx_mode, dts_mode,
                 out);
+    ctx.cross_file_mode = true;
     for (int i = 0; i < import_count; i++) {
         if (import_names && import_qns && import_names[i] && import_qns[i]) {
             ts_lsp_add_import(&ctx, import_names[i], import_qns[i]);
         }
     }
+    ts_lsp_collect_import_aliases(&ctx, root);
 
     ast_sweep_shapes(&ctx, root, &overlay);
-    rebuild_signatures_from_ast(&ctx, root, &overlay);
-    convert_signature_type_params(&ctx, root, &overlay);
+    refine_ast_signatures(&ctx, root, &overlay);
     apply_jsdoc_signatures(&ctx, root, &overlay);
     infer_implicit_returns(&ctx, root, &overlay);
 
@@ -5253,13 +6455,14 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
             rf.short_name = d->short_name;
             rf.min_params = -1;
             // Return types from pipe-separated return_types text.
+            const CBMType **rets = NULL;
             if (d->return_types && d->return_types[0]) {
                 int n = 1;
                 for (const char *s = d->return_types; *s; s++)
                     if (*s == '|')
                         n++;
-                const CBMType **rets = (const CBMType **)cbm_arena_alloc(
-                    arena, (size_t)(n + 1) * sizeof(const CBMType *));
+                rets = (const CBMType **)cbm_arena_alloc(arena,
+                                                         (size_t)(n + 1) * sizeof(const CBMType *));
                 if (rets) {
                     int idx = 0;
                     const char *start = d->return_types;
@@ -5273,9 +6476,13 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
                         }
                     }
                     rets[idx] = NULL;
-                    rf.signature = cbm_type_func(arena, NULL, NULL, rets);
                 }
             }
+            CBMTSLSPSignatureParserContext param_parser_ctx = {d->def_module_qn};
+            const CBMType **params = cbm_type_materialize_signature_params(
+                arena, d->signature_param_types, d->signature_param_count,
+                cbm_ts_lsp_parse_signature_param_text, &param_parser_ctx);
+            rf.signature = cbm_type_func(arena, NULL, params, rets);
             if (strcmp(d->label, "Method") == 0 && d->receiver_type) {
                 rf.receiver_type = d->receiver_type;
             }
@@ -5296,7 +6503,7 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
             jsx_mode ? (js_mode ? tree_sitter_javascript() : tree_sitter_tsx())
                      : (js_mode ? tree_sitter_javascript() : tree_sitter_typescript());
         ts_parser_set_language(parser, lang);
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         ts_parser_delete(parser);
         if (!tree)
             return;
@@ -5317,6 +6524,7 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
 
     TSLSPContext ctx;
     ts_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, js_mode, jsx_mode, dts_mode, out);
+    ctx.cross_file_mode = true;
 
     // Add imports early so type passes can resolve imported types.
     for (int i = 0; i < import_count; i++) {
@@ -5324,10 +6532,10 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
             ts_lsp_add_import(&ctx, import_names[i], import_qns[i]);
         }
     }
+    ts_lsp_collect_import_aliases(&ctx, root);
 
     ast_sweep_shapes(&ctx, root, &reg);
-    rebuild_signatures_from_ast(&ctx, root, &reg);
-    convert_signature_type_params(&ctx, root, &reg);
+    refine_ast_signatures(&ctx, root, &reg);
     apply_jsdoc_signatures(&ctx, root, &reg);
     infer_implicit_returns(&ctx, root, &reg);
 

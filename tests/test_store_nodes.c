@@ -6,10 +6,92 @@
  */
 #include "test_framework.h"
 #include <store/store.h>
+#include <foundation/constants.h>
+#include <cbm.h>
 #include <sqlite3.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+
+typedef struct {
+    int calls;
+    int cancel_on_call;
+} file_outline_cancel_probe_t;
+
+static bool file_outline_cancel_probe(void *context) {
+    file_outline_cancel_probe_t *probe = context;
+    probe->calls++;
+    return probe->calls >= probe->cancel_on_call;
+}
+
+/* ── Label allowlist / SQL drift guard ──────────────────────────── */
+
+/* CONTRACT PIN. `cbm_label_is_type_like()` is documented in cbm.h as the single
+ * source of truth for type-like labels, "instead of scattering
+ * `|| strcmp(label,\"Struct\")==0` across the tree". A SQL string literal cannot
+ * call it, so four queries in store.c and the BM25 ranking in mcp.c hardcoded
+ * their own label lists — and silently stopped matching once Struct (Rust, Go,
+ * Swift, D) began being emitted. get_architecture and vector search dropped
+ * every struct in the project; search_code under-ranked them.
+ *
+ * This pins the SQL mirrors to the C predicate in BOTH directions, so the next
+ * type-like label fails here instead of quietly shrinking query results. */
+TEST(sql_label_allowlists_match_cbm_label_is_type_like) {
+    /* Every label the C predicate accepts must appear in the SQL fragment. */
+    static const char *const type_like[] = {"Class", "Struct", "Interface",
+                                            "Enum",  "Type",   "Trait"};
+    for (size_t i = 0; i < sizeof(type_like) / sizeof(type_like[0]); i++) {
+        ASSERT_TRUE(cbm_label_is_type_like(type_like[i]));
+        char quoted[64];
+        snprintf(quoted, sizeof(quoted), "'%s'", type_like[i]);
+        ASSERT_NOT_NULL(strstr(CBM_SQL_TYPE_LIKE_LABELS, quoted));
+        ASSERT_NOT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, quoted));
+    }
+    /* And nothing the predicate rejects may be smuggled into the type-like
+     * fragment — otherwise the SQL would widen past the C contract. */
+    static const char *const not_type_like[] = {"Function", "Method", "Module",
+                                                "File",     "Folder", "Variable"};
+    for (size_t i = 0; i < sizeof(not_type_like) / sizeof(not_type_like[0]); i++) {
+        ASSERT_FALSE(cbm_label_is_type_like(not_type_like[i]));
+        char quoted[64];
+        snprintf(quoted, sizeof(quoted), "'%s'", not_type_like[i]);
+        ASSERT_NULL(strstr(CBM_SQL_TYPE_LIKE_LABELS, quoted));
+    }
+    /* The callable fragment carries exactly Function and Method on top. */
+    ASSERT_NOT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, "'Function'"));
+    ASSERT_NOT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, "'Method'"));
+    PASS();
+}
+
+/* Same drift guard for the relation labels (Table/View — SQL data lineage).
+ * Relations are registry symbols but deliberately NOT type-like: the default
+ * cbm_registry_resolve vetoes them, so a code identifier sharing a table's
+ * name never binds into the lineage layer. */
+TEST(sql_relation_labels_match_cbm_label_is_relation) {
+    static const char *const relations[] = {"Table", "View", "Model"};
+    for (size_t i = 0; i < sizeof(relations) / sizeof(relations[0]); i++) {
+        ASSERT_TRUE(cbm_label_is_relation(relations[i]));
+        ASSERT_TRUE(cbm_label_is_registry_symbol(relations[i]));
+        ASSERT_FALSE(cbm_label_is_type_like(relations[i]));
+        char quoted[64];
+        snprintf(quoted, sizeof(quoted), "'%s'", relations[i]);
+        ASSERT_NOT_NULL(strstr(CBM_SQL_RELATION_LABELS, quoted));
+        /* Relations must NOT ride in the callable/type fragments — the arch
+         * queries opt in explicitly by appending CBM_SQL_RELATION_LABELS. */
+        ASSERT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, quoted));
+    }
+    /* cbm_label_is_registry_symbol covers exactly the seeded families. */
+    ASSERT_TRUE(cbm_label_is_registry_symbol("Function"));
+    ASSERT_TRUE(cbm_label_is_registry_symbol("Method"));
+    ASSERT_TRUE(cbm_label_is_registry_symbol("Class"));
+    ASSERT_TRUE(cbm_label_is_registry_symbol("Variable"));
+    ASSERT_TRUE(cbm_label_is_registry_symbol("Field"));
+    ASSERT_FALSE(cbm_label_is_registry_symbol("Module"));
+    ASSERT_FALSE(cbm_label_is_registry_symbol("File"));
+    ASSERT_FALSE(cbm_label_is_relation("Class"));
+    ASSERT_FALSE(cbm_label_is_relation(NULL));
+    PASS();
+}
 
 /* ── Schema / Open / Close ──────────────────────────────────────── */
 
@@ -107,6 +189,101 @@ TEST(store_project_delete) {
     rc = cbm_store_get_project(s, "test", &p);
     ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
 
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── QN suffix / callable-base lookups (#2061) ─────────────────── */
+
+static void qn_lookup_node(cbm_store_t *s, const char *name, const char *qn) {
+    cbm_node_t n = {.project = "test",
+                    .label = "Method",
+                    .name = name,
+                    .qualified_name = qn,
+                    .file_path = "a.java",
+                    .start_line = 1,
+                    .end_line = 2};
+    cbm_store_upsert_node(s, &n);
+}
+
+/* The suffix tier matches its text literally: '_' is not a LIKE wildcard,
+ * so `my_func` must not also find `myXfunc`. */
+TEST(store_qn_suffix_is_literal) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    qn_lookup_node(s, "my_func", "test.a.my_func");
+    qn_lookup_node(s, "myXfunc", "test.a.myXfunc");
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_suffix(s, "test", "my_func", &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(nodes[0].qualified_name, "test.a.my_func");
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A suffix longer than the old 512-byte pattern buffer is not truncated into
+ * a pattern that matches nothing. */
+TEST(store_qn_suffix_is_unbounded) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    char leaf[601];
+    memset(leaf, 'a', sizeof(leaf) - 1);
+    leaf[sizeof(leaf) - 1] = '\0';
+    char long_qn[640];
+    char long_suffix[640];
+    snprintf(long_qn, sizeof(long_qn), "test.m.%s", leaf);
+    snprintf(long_suffix, sizeof(long_suffix), "m.%s", leaf);
+    qn_lookup_node(s, leaf, long_qn);
+
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_suffix(s, "test", long_suffix, &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(nodes[0].qualified_name, long_qn);
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A bare base QN (exact, or as a dotted suffix) finds every signature-
+ * qualified overload of it, and never an unsuffixed QN — so the tier is inert
+ * until a language mints suffixes. */
+TEST(store_qn_base_finds_overloads_only) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    qn_lookup_node(s, "work", "test.S.work(int)");
+    qn_lookup_node(s, "work", "test.S.work(String)");
+    qn_lookup_node(s, "work", "test.S.work");
+    qn_lookup_node(s, "workx", "test.S.workx(int)");
+    qn_lookup_node(s, "operator()", "test.S.operator()");
+    qn_lookup_node(s, "Work", "test.C.Work<T>(T)");
+
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_base(s, "test", "test.S.work", false, &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    cbm_store_free_nodes(nodes, count);
+
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_base(s, "test", "S.work", true, &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    cbm_store_free_nodes(nodes, count);
+
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_base(s, "test", "test.C.Work", false, &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    cbm_store_free_nodes(nodes, count);
+
+    /* `operator()` is a bare C++ leaf, not "operator" + "()". */
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_base(s, "test", "test.S.operator", false, &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_nodes(nodes, count);
     cbm_store_close(s);
     PASS();
 }
@@ -225,6 +402,122 @@ TEST(store_node_find_by_label) {
     PASS();
 }
 
+static bool scan_str_same(const char *a, const char *b) {
+    return (!a && !b) || (a && b && strcmp(a, b) == 0);
+}
+
+static bool scan_node_same(const cbm_node_t *a, const cbm_node_t *b) {
+    return a->id == b->id && scan_str_same(a->project, b->project) &&
+           scan_str_same(a->label, b->label) && scan_str_same(a->name, b->name) &&
+           scan_str_same(a->qualified_name, b->qualified_name) &&
+           scan_str_same(a->file_path, b->file_path) && a->start_line == b->start_line &&
+           a->end_line == b->end_line && scan_str_same(a->properties_json, b->properties_json);
+}
+
+/* The streamed scan gives the eager scan's rows, field for field and in the
+ * same order, at any batch size, while other lookups (including the eager
+ * scans' own cached statements) run between batches. Returns the row count,
+ * or -1 on the first difference; *paged tells whether the scan paged. */
+static int scan_matches_eager(cbm_store_t *s, const char *project, const char *label, int batch,
+                              bool *paged) {
+    cbm_node_t *eager = NULL;
+    int n = 0;
+    int rc = label ? cbm_store_find_nodes_by_label(s, project, label, &eager, &n)
+                   : cbm_store_find_nodes(s, project, &eager, &n);
+    if (rc != CBM_STORE_OK) {
+        return -1;
+    }
+    cbm_store_node_scan_t *scan = cbm_store_node_scan_open(s, project, label);
+    *paged = cbm_store_node_scan_paged(scan);
+    cbm_node_t buf[64];
+    int seen = 0;
+    bool same = scan != NULL && batch <= 64;
+    int got = 0;
+    while (same && cbm_store_node_scan_next(scan, buf, batch, &got) == CBM_STORE_OK && got > 0) {
+        for (int i = 0; i < got; i++, seen++) {
+            same = same && seen < n && scan_node_same(&buf[i], &eager[seen]);
+            cbm_node_free_fields(&buf[i]);
+        }
+        cbm_node_t *other = NULL;
+        int other_n = 0;
+        (void)cbm_store_find_nodes(s, project, &other, &other_n);
+        cbm_store_free_nodes(other, other_n);
+        (void)cbm_store_find_nodes_by_label(s, project, "Class", &other, &other_n);
+        cbm_store_free_nodes(other, other_n);
+    }
+    /* An exhausted scan stays exhausted. */
+    same = same && cbm_store_node_scan_next(scan, buf, batch, &got) == CBM_STORE_OK && got == 0;
+    cbm_store_node_scan_close(scan);
+    cbm_store_free_nodes(eager, n);
+    return same && seen == n ? n : -1;
+}
+
+/* Pages of 1, 3 and 64 rows end inside files, at file boundaries and inside
+ * the NULL file_path rows, which the eager all-nodes order puts first. The
+ * upsert API stores "" for a missing path; other writers may store NULL. */
+TEST(store_node_scan_streams_eager_scan_order) {
+    enum { SCAN_NODES = 60 };
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_store_upsert_project(s, "other", "/tmp/other");
+    static const char *const labels[] = {"Function", "Class", "Method"};
+    static const char *const files[] = {"b.c", "a.c", "", "c.c"};
+    int in_test = 0;
+    int test_functions = 0;
+    int other_methods = 0;
+    for (int i = 0; i < SCAN_NODES; i++) {
+        bool other = i % 4 == 3;
+        char name[32];
+        char qn[64];
+        char props[64];
+        snprintf(name, sizeof(name), "n%d", (i * 17) % 40);
+        snprintf(qn, sizeof(qn), "%s.n%d", other ? "other" : "test", i);
+        snprintf(props, sizeof(props), "{\"complexity\":%d}", i);
+        cbm_node_t n = {.project = other ? "other" : "test",
+                        .label = labels[i % 3],
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = files[(i / 2) % 4],
+                        .start_line = i,
+                        .end_line = i + 5,
+                        .properties_json = i % 5 ? props : NULL};
+        ASSERT_GT(cbm_store_upsert_node(s, &n), 0);
+        in_test += other ? 0 : 1;
+        test_functions += !other && i % 3 == 0 ? 1 : 0;
+        other_methods += other && i % 3 == 2 ? 1 : 0;
+    }
+    ASSERT_EQ(cbm_store_exec(s, "UPDATE nodes SET file_path = NULL WHERE start_line % 7 = 0;"), 0);
+    cbm_node_t *eager = NULL;
+    int eager_n = 0;
+    ASSERT_EQ(cbm_store_find_nodes(s, "test", &eager, &eager_n), CBM_STORE_OK);
+    ASSERT_TRUE(eager_n > 0 && eager[0].file_path == NULL); /* NULL rows come first */
+    cbm_store_free_nodes(eager, eager_n);
+
+    static const int batches[] = {1, 3, 64};
+    bool paged = false;
+    for (size_t b = 0; b < sizeof(batches) / sizeof(batches[0]); b++) {
+        ASSERT_EQ(scan_matches_eager(s, "test", NULL, batches[b], &paged), in_test);
+        ASSERT_TRUE(paged);
+        ASSERT_EQ(scan_matches_eager(s, "test", "Function", batches[b], &paged), test_functions);
+        ASSERT_TRUE(paged);
+        ASSERT_EQ(scan_matches_eager(s, "other", NULL, batches[b], &paged),
+                  SCAN_NODES - in_test); /* project filter */
+        ASSERT_EQ(scan_matches_eager(s, "other", "Method", batches[b], &paged), other_methods);
+        ASSERT_EQ(scan_matches_eager(s, "test", "NoSuchLabel", batches[b], &paged), 0);
+        ASSERT_EQ(scan_matches_eager(s, "missing", NULL, batches[b], &paged), 0);
+    }
+
+    /* Without the node indexes the eager queries take other plans, which the
+     * pages would not reproduce: the scan hands out the eager rows instead. */
+    ASSERT_EQ(cbm_store_drop_indexes(s), 0);
+    ASSERT_EQ(scan_matches_eager(s, "test", NULL, 3, &paged), in_test);
+    ASSERT_FALSE(paged);
+    ASSERT_EQ(scan_matches_eager(s, "test", "Function", 3, &paged), test_functions);
+    ASSERT_FALSE(paged);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_node_find_by_file) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
@@ -254,6 +547,156 @@ TEST(store_node_find_by_file) {
     ASSERT_EQ(rc, CBM_STORE_OK);
     ASSERT_EQ(count, 2);
     cbm_store_free_nodes(nodes, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_file_outline_is_filtered_stable_bounded_and_cancellable_issue469) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "outline", "/tmp/outline"), CBM_STORE_OK);
+
+    cbm_node_t nodes[] = {
+        {.project = "outline",
+         .label = "Method",
+         .name = "omega",
+         .qualified_name = "outline.main.omega",
+         .file_path = "main.c",
+         .start_line = 30,
+         .end_line = 33},
+        {.project = "outline",
+         .label = "Module",
+         .name = "main",
+         .qualified_name = "outline.main",
+         .file_path = "main.c",
+         .start_line = 1,
+         .end_line = 80},
+        {.project = "outline",
+         .label = "Function",
+         .name = "zeta",
+         .qualified_name = "outline.main.zeta",
+         .file_path = "main.c",
+         .start_line = 10,
+         .end_line = 20},
+        {.project = "outline",
+         .label = "Function",
+         .name = "alpha",
+         .qualified_name = "outline.main.alpha",
+         .file_path = "main.c",
+         .start_line = 10,
+         .end_line = 15},
+        {.project = "outline",
+         .label = "Class",
+         .name = "VisibleWithoutFilter",
+         .qualified_name = "outline.main.VisibleWithoutFilter",
+         .file_path = "main.c",
+         .start_line = 5,
+         .end_line = 40},
+        {.project = "outline",
+         .label = "Function",
+         .name = "other",
+         .qualified_name = "outline.other.other",
+         .file_path = "other.c",
+         .start_line = 1,
+         .end_line = 2},
+    };
+    for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+        ASSERT_GT(cbm_store_upsert_node(s, &nodes[i]), 0);
+    }
+
+    static const char *const labels[] = {"Function", "Method"};
+    cbm_file_outline_row_t *rows = NULL;
+    int count = 0;
+    int total = 0;
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", labels, 2, 2, 0, NULL, NULL, &rows,
+                                         &count, &total),
+              CBM_STORE_OK);
+    ASSERT_EQ(total, 3);
+    ASSERT_EQ(count, 2);
+    ASSERT_STR_EQ(rows[0].name, "alpha");
+    ASSERT_STR_EQ(rows[1].name, "zeta");
+    cbm_store_free_file_outline(rows, count);
+
+    rows = NULL;
+    count = 0;
+    total = 0;
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", labels, 2, 2, 2, NULL, NULL, &rows,
+                                         &count, &total),
+              CBM_STORE_OK);
+    ASSERT_EQ(total, 3);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(rows[0].name, "omega");
+    cbm_store_free_file_outline(rows, count);
+
+    rows = NULL;
+    count = 0;
+    total = 0;
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", NULL, 0, 10, 0, NULL, NULL, &rows,
+                                         &count, &total),
+              CBM_STORE_OK);
+    ASSERT_EQ(total, 4);
+    ASSERT_EQ(count, 4);
+    ASSERT_STR_EQ(rows[0].name, "VisibleWithoutFilter");
+    ASSERT_STR_EQ(rows[1].name, "alpha");
+    ASSERT_STR_EQ(rows[2].name, "zeta");
+    ASSERT_STR_EQ(rows[3].name, "omega");
+    cbm_store_free_file_outline(rows, count);
+
+    file_outline_cancel_probe_t probe = {.cancel_on_call = 3};
+    rows = (cbm_file_outline_row_t *)(uintptr_t)1;
+    count = 99;
+    total = 99;
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", labels, 2, 2, 0,
+                                         file_outline_cancel_probe, &probe, &rows, &count, &total),
+              CBM_STORE_CANCELLED);
+    ASSERT_NULL(rows);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(total, 0);
+    ASSERT_TRUE(probe.calls >= 3);
+
+    const char *empty_label[] = {""};
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", empty_label, 1, 1, 0, NULL, NULL,
+                                         &rows, &count, &total),
+              CBM_STORE_ERR);
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", NULL, 0,
+                                         CBM_STORE_FILE_OUTLINE_MAX_LIMIT + 1, 0, NULL, NULL, &rows,
+                                         &count, &total),
+              CBM_STORE_ERR);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_file_outline_fails_closed_on_text_budget_issue469) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "outline-budget", "/tmp/outline-budget"), CBM_STORE_OK);
+
+    size_t qn_size = CBM_STORE_FILE_OUTLINE_MAX_TEXT_BYTES + 64U;
+    char *large_qn = malloc(qn_size + 1U);
+    ASSERT_NOT_NULL(large_qn);
+    memset(large_qn, 'q', qn_size);
+    large_qn[qn_size] = '\0';
+    cbm_node_t node = {.project = "outline-budget",
+                       .label = "Function",
+                       .name = "oversized",
+                       .qualified_name = large_qn,
+                       .file_path = "large.c",
+                       .start_line = 1,
+                       .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+    free(large_qn);
+
+    cbm_file_outline_row_t *rows = (cbm_file_outline_row_t *)(uintptr_t)1;
+    int count = 99;
+    int total = 99;
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline-budget", "large.c", NULL, 0, 1, 0, NULL, NULL,
+                                         &rows, &count, &total),
+              CBM_STORE_SCAN_LIMIT);
+    ASSERT_NULL(rows);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(total, 0);
 
     cbm_store_close(s);
     PASS();
@@ -456,6 +899,169 @@ TEST(store_file_hash_crud) {
     rc = cbm_store_get_file_hashes(s, "test", &hashes, &count);
     ASSERT_EQ(count, 0);
     cbm_store_free_file_hashes(hashes, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_lsp_surface_round_trip) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* Empty project: OK + zero rows — the "no surface data, route to full
+     * rebuild" signal, and the upgrade path for pre-table databases. */
+    cbm_lsp_surface_row_t *rows = NULL;
+    int count = CBM_NOT_FOUND;
+    ASSERT_EQ(cbm_store_get_lsp_surfaces(s, "test", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_lsp_surfaces(rows, count);
+
+    /* Batch with the field shapes the codec will produce: a real defs array,
+     * an empty surface, a binary bloom (with embedded NUL), and no bloom. */
+    const unsigned char bloom[] = {0x01, 0x00, 0xfe, 0x7f, 0x00, 0xab};
+    cbm_lsp_surface_row_t in[] = {
+        {.project = "test",
+         .rel_path = "pkg/a.go",
+         .surface_sha = "sha-a",
+         .defs_json = "[{\"qn\":\"pkg.A\",\"sn\":\"A\",\"label\":\"Function\"}]",
+         .ref_bloom = bloom,
+         .ref_bloom_len = (int)sizeof(bloom),
+         .config_ctx = "cfg-1"},
+        {.project = "test",
+         .rel_path = "pkg/b.go",
+         .surface_sha = "sha-b",
+         .defs_json = "[]",
+         .ref_bloom = NULL,
+         .ref_bloom_len = 0,
+         .config_ctx = ""},
+    };
+    ASSERT_EQ(cbm_store_upsert_lsp_surface_batch(s, in, 2), CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_store_get_lsp_surfaces(s, "test", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    /* ORDER BY rel_path: a.go before b.go. */
+    ASSERT_STR_EQ(rows[0].rel_path, "pkg/a.go");
+    ASSERT_STR_EQ(rows[0].surface_sha, "sha-a");
+    ASSERT_STR_EQ(rows[0].defs_json, "[{\"qn\":\"pkg.A\",\"sn\":\"A\",\"label\":\"Function\"}]");
+    ASSERT_STR_EQ(rows[0].config_ctx, "cfg-1");
+    ASSERT_EQ(rows[0].ref_bloom_len, (int)sizeof(bloom));
+    ASSERT_TRUE(rows[0].ref_bloom != NULL && memcmp(rows[0].ref_bloom, bloom, sizeof(bloom)) == 0);
+    ASSERT_STR_EQ(rows[1].rel_path, "pkg/b.go");
+    ASSERT_STR_EQ(rows[1].defs_json, "[]");
+    ASSERT_EQ(rows[1].ref_bloom_len, 0);
+    ASSERT_TRUE(rows[1].ref_bloom == NULL);
+    cbm_store_free_lsp_surfaces(rows, count);
+
+    /* Upsert-on-conflict replaces the whole row, including dropping a bloom. */
+    cbm_lsp_surface_row_t update = {.project = "test",
+                                    .rel_path = "pkg/a.go",
+                                    .surface_sha = "sha-a2",
+                                    .defs_json = "[]",
+                                    .ref_bloom = NULL,
+                                    .ref_bloom_len = 0,
+                                    .config_ctx = ""};
+    ASSERT_EQ(cbm_store_upsert_lsp_surface_batch(s, &update, 1), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_lsp_surfaces(s, "test", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_STR_EQ(rows[0].surface_sha, "sha-a2");
+    ASSERT_EQ(rows[0].ref_bloom_len, 0);
+    cbm_store_free_lsp_surfaces(rows, count);
+
+    /* Project-scoped delete removes everything. */
+    ASSERT_EQ(cbm_store_delete_lsp_surfaces(s, "test"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_lsp_surfaces(s, "test", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_lsp_surfaces(rows, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_dependent_files_lookup) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* a.py and c.py each call into b.py; b.py also references itself, and
+     * d.py sits apart. Dependents of {b.py} must be exactly {a.py, c.py}:
+     * the self-reference is not a dependent, d.py is unrelated. */
+    const char *files[] = {"a.py", "b.py", "c.py", "d.py"};
+    int64_t ids[4] = {0};
+    for (int i = 0; i < 4; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "test.%s.fn", files[i]);
+        cbm_node_t n = {.project = "test",
+                        .label = "Function",
+                        .name = "fn",
+                        .qualified_name = qn,
+                        .file_path = files[i],
+                        .start_line = 1,
+                        .end_line = 2,
+                        .properties_json = "{}"};
+        ids[i] = cbm_store_upsert_node(s, &n);
+        ASSERT_TRUE(ids[i] > 0);
+    }
+    const int64_t edge_pairs[][2] = {{ids[0], ids[1]}, {ids[2], ids[1]}, {ids[1], ids[1]}};
+    for (int i = 0; i < 3; i++) {
+        cbm_edge_t e = {.project = "test",
+                        .source_id = edge_pairs[i][0],
+                        .target_id = edge_pairs[i][1],
+                        .type = "CALLS",
+                        .properties_json = "{}"};
+        ASSERT_TRUE(cbm_store_insert_edge(s, &e) > 0);
+    }
+
+    /* Structural container noise: a Folder node (placeholder file_path)
+     * with a CONTAINS_FILE edge into b.py must never surface as a
+     * dependent — it is not a source file and cannot be re-resolved. */
+    cbm_node_t folder = {.project = "test",
+                         .label = "Folder",
+                         .name = "pkg",
+                         .qualified_name = "test.pkg",
+                         .file_path = "{}",
+                         .start_line = 0,
+                         .end_line = 0,
+                         .properties_json = "{}"};
+    int64_t folder_id = cbm_store_upsert_node(s, &folder);
+    ASSERT_TRUE(folder_id > 0);
+    cbm_edge_t contains = {.project = "test",
+                           .source_id = folder_id,
+                           .target_id = ids[1],
+                           .type = "CONTAINS_FILE",
+                           .properties_json = "{}"};
+    ASSERT_TRUE(cbm_store_insert_edge(s, &contains) > 0);
+
+    const char *targets[] = {"b.py"};
+    char **deps = NULL;
+    int dep_count = 0;
+    ASSERT_EQ(cbm_store_get_dependent_files(s, "test", targets, 1, &deps, &dep_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(dep_count, 2);
+    bool saw_a = false;
+    bool saw_c = false;
+    for (int i = 0; i < dep_count; i++) {
+        saw_a = saw_a || strcmp(deps[i], "a.py") == 0;
+        saw_c = saw_c || strcmp(deps[i], "c.py") == 0;
+    }
+    ASSERT_TRUE(saw_a && saw_c);
+    cbm_store_free_dependent_files(deps, dep_count);
+
+    /* No inbound edges: an isolated target has no dependents. */
+    const char *targets_d[] = {"d.py"};
+    ASSERT_EQ(cbm_store_get_dependent_files(s, "test", targets_d, 1, &deps, &dep_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(dep_count, 0);
+    cbm_store_free_dependent_files(deps, dep_count);
+
+    /* A target list already containing the dependent excludes it: asking for
+     * dependents of {a.py, b.py} returns only c.py. */
+    const char *targets_ab[] = {"a.py", "b.py"};
+    ASSERT_EQ(cbm_store_get_dependent_files(s, "test", targets_ab, 2, &deps, &dep_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(dep_count, 1);
+    ASSERT_STR_EQ(deps[0], "c.py");
+    cbm_store_free_dependent_files(deps, dep_count);
 
     cbm_store_close(s);
     PASS();
@@ -1060,6 +1666,48 @@ TEST(store_integrity_corrupt_too_many_rows) {
     PASS();
 }
 
+/* ── Quarantine verdict (#1206, #1037) ──────────────────────────────
+ *
+ * The bool check above cannot answer the only question the quarantine path
+ * actually asks: "is this database damaged, or did I just lose a lock race?"
+ * Answering "damaged" to the second question is what made concurrent instances
+ * rename each other's HEALTHY databases to .corrupt (#1206). These bind the
+ * three-way verdict so that behaviour cannot come back. */
+
+TEST(store_integrity_verdict_healthy_is_ok) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "healthy-proj", "/tmp/healthy");
+    ASSERT_EQ(cbm_store_check_integrity_verdict(s), CBM_INTEGRITY_OK);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_integrity_verdict_real_corruption_is_corrupt) {
+    /* Structural damage the shallow check can see: node IDs landing in
+     * root_path. This one MUST be quarantinable — a verdict that never says
+     * CORRUPT would protect broken databases instead of users. */
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_exec(db,
+                 "INSERT INTO projects (name, indexed_at, root_path) "
+                 "VALUES ('broken', '2024-01-01', '826');",
+                 NULL, NULL, NULL);
+    ASSERT_EQ(cbm_store_check_integrity_verdict(s), CBM_INTEGRITY_CORRUPT);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_integrity_verdict_unopenable_is_transient_not_corrupt) {
+    /* A handle we could not open tells us NOTHING about the file's contents.
+     * Reporting CORRUPT here is how a database nobody could read got renamed
+     * and rebuilt from scratch (#1206) — the destructive answer to a question
+     * that was never asked. */
+    ASSERT_EQ(cbm_store_check_integrity_verdict(NULL), CBM_INTEGRITY_TRANSIENT);
+    PASS();
+}
+
 TEST(store_integrity_null_check) {
     /* NULL store should return false (not crash) */
     ASSERT_FALSE(cbm_store_check_integrity(NULL));
@@ -1593,6 +2241,37 @@ TEST(store_count_nodes_unknown_project) {
     PASS();
 }
 
+/* A COUNT(*) that cannot be read must not be reported as a count of zero:
+ * index_status renders that as the positive assertion status "empty", so a
+ * corrupt project looks like one that was never indexed. Dropping the table
+ * after the statement is cached makes the step fail deterministically. */
+TEST(store_count_failed_read_is_not_zero) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t n = {.project = "test",
+                    .label = "File",
+                    .name = "main.c",
+                    .qualified_name = "test.main.c",
+                    .file_path = "main.c"};
+    cbm_store_upsert_node(s, &n);
+
+    /* Sanity: a readable table still counts normally. */
+    ASSERT_EQ(cbm_store_count_nodes(s, "test"), 1);
+    ASSERT_TRUE(cbm_store_count_edges(s, "test") >= 0);
+
+    /* Make the read fail. The statements are cached by the calls above, so the
+     * step (not the prepare) is what fails once the tables are gone. */
+    ASSERT_EQ(cbm_store_exec(s, "DROP TABLE nodes;"), 0);
+    ASSERT_EQ(cbm_store_exec(s, "DROP TABLE edges;"), 0);
+
+    ASSERT_TRUE(cbm_store_count_nodes(s, "test") < 0);
+    ASSERT_TRUE(cbm_store_count_edges(s, "test") < 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Index coverage (#963) ──────────────────────────────────────── */
 
 /* Round-trip + deleted-file prune + shadow miss-graph materialization +
@@ -1668,8 +2347,447 @@ TEST(store_coverage_roundtrip_prune_shadow) {
     PASS();
 }
 
+TEST(store_coverage_targeted_path_and_scope_lookup) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "coverage-targeted", "/tmp/coverage-targeted"),
+              CBM_STORE_OK);
+
+    /* Failure rows need live-file hash records so coverage_replace does not
+     * correctly prune them as deleted. By-design exclusions have no hashes. */
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-targeted", "src/partial.c", "", 10, 20),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-targeted", "src/skipped.c", "", 11, 21),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-targeted", "src2/other.c", "", 12, 22),
+              CBM_STORE_OK);
+
+    cbm_coverage_row_t rows[] = {
+        {.rel_path = "src/partial.c", .kind = "parse_partial", .detail = "7-9"},
+        {.rel_path = "src/skipped.c", .kind = "oversized", .detail = "too large"},
+        {.rel_path = "src2/other.c", .kind = "extract", .detail = "parser failed"},
+        {.rel_path = "generated", .kind = "not_indexed_dir", .detail = "excluded subtree"},
+        {.rel_path = "secret.c", .kind = "not_indexed_file", .detail = "gitignore"},
+    };
+    ASSERT_EQ(cbm_store_coverage_replace(s, "coverage-targeted", rows, 5), CBM_STORE_OK);
+
+    cbm_coverage_row_t *got = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(s, "coverage-targeted", "src/partial.c", &got, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(got[0].rel_path, "src/partial.c");
+    ASSERT_STR_EQ(got[0].kind, "parse_partial");
+    ASSERT_STR_EQ(got[0].detail, "7-9");
+    cbm_store_free_coverage(got, count);
+
+    /* A file below an excluded directory inherits that directory row. */
+    got = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(s, "coverage-targeted", "generated/nested/file.c", &got,
+                                          &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(got[0].rel_path, "generated");
+    ASSERT_STR_EQ(got[0].kind, "not_indexed_dir");
+    cbm_store_free_coverage(got, count);
+
+    /* Prefixes must stop at path-segment boundaries. */
+    got = NULL;
+    count = 0;
+    ASSERT_EQ(
+        cbm_store_coverage_get_path(s, "coverage-targeted", "generated2/file.c", &got, &count),
+        CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_coverage(got, count);
+
+    got = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_scope(s, "coverage-targeted", "src", &got, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_STR_EQ(got[0].rel_path, "src/partial.c");
+    ASSERT_STR_EQ(got[1].rel_path, "src/skipped.c");
+    cbm_store_free_coverage(got, count);
+
+    /* A scope nested below an excluded directory still reports its ancestor. */
+    got = NULL;
+    count = 0;
+    ASSERT_EQ(
+        cbm_store_coverage_get_scope(s, "coverage-targeted", "generated/nested", &got, &count),
+        CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(got[0].rel_path, "generated");
+    cbm_store_free_coverage(got, count);
+
+    cbm_file_hash_t hash = {0};
+    ASSERT_EQ(cbm_store_get_file_hash(s, "coverage-targeted", "src/partial.c", &hash),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(hash.project, "coverage-targeted");
+    ASSERT_STR_EQ(hash.rel_path, "src/partial.c");
+    ASSERT_EQ(hash.mtime_ns, 10);
+    ASSERT_EQ(hash.size, 20);
+    cbm_store_clear_file_hash(&hash);
+    ASSERT_NULL(hash.project);
+    ASSERT_NULL(hash.rel_path);
+    ASSERT_NULL(hash.sha256);
+
+    ASSERT_EQ(cbm_store_get_file_hash(s, "coverage-targeted", "missing.c", &hash),
+              CBM_STORE_NOT_FOUND);
+    cbm_store_clear_file_hash(&hash);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_coverage_meta_zero_row_truncation_and_delete) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "coverage-meta", "/tmp/coverage-meta"), CBM_STORE_OK);
+
+    cbm_coverage_meta_t write_meta = {
+        .generation = "generation-42",
+        .index_mode = "fast",
+        .recording_status = "truncated",
+        .ignored_files_stored = 2000,
+        .ignored_files_total = 2501,
+        .coverage_version = 1,
+        .hash_records_complete = false,
+    };
+    /* Metadata is meaningful even when the authoritative miss set is empty. */
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-meta", NULL, 0, &write_meta),
+              CBM_STORE_OK);
+
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(s, "coverage-meta", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_coverage(rows, count);
+
+    cbm_coverage_meta_t got = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-meta", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.project, "coverage-meta");
+    ASSERT_STR_EQ(got.generation, "generation-42");
+    ASSERT_NOT_NULL(got.recorded_at);
+    ASSERT_STR_EQ(got.index_mode, "fast");
+    ASSERT_STR_EQ(got.recording_status, "truncated");
+    ASSERT_EQ(got.ignored_files_stored, 2000);
+    ASSERT_EQ(got.ignored_files_total, 2501);
+    ASSERT_EQ(got.coverage_version, 1);
+    ASSERT_FALSE(got.hash_records_complete);
+    cbm_store_coverage_meta_clear(&got);
+    ASSERT_NULL(got.project);
+    ASSERT_NULL(got.generation);
+    ASSERT_NULL(got.recorded_at);
+    ASSERT_NULL(got.index_mode);
+    ASSERT_NULL(got.recording_status);
+
+    /* Replacing through the compatibility wrapper clears possibly-stale meta. */
+    ASSERT_EQ(cbm_store_coverage_replace(s, "coverage-meta", NULL, 0), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-meta", &got), CBM_STORE_NOT_FOUND);
+    cbm_store_coverage_meta_clear(&got);
+
+    /* Recreate metadata and a missed-graph node, then project deletion must
+     * remove the table rows, metadata, and the derived ::missed project. */
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-meta", "bad.c", "", 1, 1), CBM_STORE_OK);
+    cbm_coverage_row_t failure = {.rel_path = "bad.c", .kind = "parse_partial", .detail = "1-2"};
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-meta", &failure, 1, &write_meta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_delete_project(s, "coverage-meta"), CBM_STORE_OK);
+
+    rows = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(s, "coverage-meta", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_coverage(rows, count);
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-meta", &got), CBM_STORE_NOT_FOUND);
+    cbm_store_coverage_meta_clear(&got);
+    cbm_project_t shadow = {0};
+    ASSERT_EQ(cbm_store_get_project(s, "coverage-meta::missed", &shadow), CBM_STORE_NOT_FOUND);
+    cbm_project_free_fields(&shadow);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_coverage_replace_rejects_invalid_row_arguments) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "coverage-invalid", "/tmp/coverage-invalid"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-invalid", "kept.c", "", 1, 1), CBM_STORE_OK);
+    cbm_coverage_row_t kept = {.rel_path = "kept.c", .kind = "parse_partial", .detail = "3-4"};
+    cbm_coverage_meta_t original_meta = {
+        .generation = "before-invalid-call",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = 1,
+        .hash_records_complete = true,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-invalid", &kept, 1, &original_meta),
+              CBM_STORE_OK);
+
+    cbm_coverage_meta_t replacement_meta = original_meta;
+    replacement_meta.generation = "must-not-commit";
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-invalid", &kept, -1, &replacement_meta),
+              CBM_STORE_ERR);
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-invalid", NULL, 1, &replacement_meta),
+              CBM_STORE_ERR);
+
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(s, "coverage-invalid", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(rows[0].rel_path, "kept.c");
+    ASSERT_STR_EQ(rows[0].detail, "3-4");
+    cbm_store_free_coverage(rows, count);
+    cbm_coverage_meta_t got = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-invalid", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.generation, "before-invalid-call");
+    cbm_store_coverage_meta_clear(&got);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "coverage-shadow", "/tmp/coverage-shadow"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-shadow", "old.c", "", 1, 1), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-shadow", "new.c", "", 2, 2), CBM_STORE_OK);
+
+    cbm_coverage_row_t old_row = {
+        .rel_path = "old.c", .kind = "parse_partial", .detail = "old-detail"};
+    cbm_coverage_meta_t old_meta = {
+        .generation = "old-generation",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = 1,
+        .hash_records_complete = true,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-shadow", &old_row, 1, &old_meta),
+              CBM_STORE_OK);
+    int old_shadow_nodes = cbm_store_count_nodes(s, "coverage-shadow::missed");
+    ASSERT_GT(old_shadow_nodes, 0);
+
+    /* Force only the derived-view rebuild to fail. The authoritative rows,
+     * metadata, and prior shadow graph must remain one atomic generation. */
+    ASSERT_EQ(cbm_store_exec(s, "CREATE TRIGGER fail_missed_insert BEFORE INSERT ON nodes "
+                                "WHEN NEW.project = 'coverage-shadow::missed' "
+                                "BEGIN SELECT RAISE(ABORT, 'forced missed shadow failure'); END;"),
+              CBM_STORE_OK);
+
+    cbm_coverage_row_t new_row = {
+        .rel_path = "new.c", .kind = "parse_partial", .detail = "new-detail"};
+    cbm_coverage_meta_t new_meta = old_meta;
+    new_meta.generation = "new-generation";
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-shadow", &new_row, 1, &new_meta),
+              CBM_STORE_ERR);
+
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(s, "coverage-shadow", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(rows[0].rel_path, "old.c");
+    ASSERT_STR_EQ(rows[0].detail, "old-detail");
+    cbm_store_free_coverage(rows, count);
+
+    cbm_coverage_meta_t got = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-shadow", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.generation, "old-generation");
+    cbm_store_coverage_meta_clear(&got);
+    ASSERT_EQ(cbm_store_count_nodes(s, "coverage-shadow::missed"), old_shadow_nodes);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Copy store_meta's shadow fingerprint for `project` into `out` ("" if absent). */
+static void coverage_shadow_fp(cbm_store_t *s, const char *project, char *out, size_t cap) {
+    out[0] = '\0';
+    char key[256];
+    snprintf(key, sizeof(key), "coverage_shadow_fp:%s", project);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s), "SELECT v FROM store_meta WHERE k = ?1;", -1, &stmt,
+                           NULL) != SQLITE_OK) {
+        return;
+    }
+    sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_text(stmt, 0)) {
+        snprintf(out, cap, "%s", (const char *)sqlite3_column_text(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+}
+
+/* #2265: unresolved_calls rows describe files that WERE indexed, so they stay
+ * out of the "<project>::missed" graph like by-design not_indexed_* rows:
+ * (a) a project whose only rows are unresolved_calls gets no shadow graph,
+ * (b) a file with parse_partial AND unresolved_calls keeps its parse_partial
+ *     File node (the later unresolved_calls row used to replace it), and
+ * (c) the shadow fingerprint ignores unresolved_calls rows, so the skip gate
+ *     and store_meta match a project without them. */
+TEST(store_coverage_shadow_excludes_unresolved_calls) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    const char *only = "cov-unres-only";
+    const char *mixed = "cov-unres-mixed";
+    const char *plain = "cov-unres-plain";
+    ASSERT_EQ(cbm_store_upsert_project(s, only, "/tmp/cov-unres-only"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(s, mixed, "/tmp/cov-unres-mixed"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(s, plain, "/tmp/cov-unres-plain"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, only, "src/a.go", "", 1, 1), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, only, "src/b.go", "", 2, 2), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, mixed, "src/both.go", "", 3, 3), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, mixed, "lib/calls.go", "", 4, 4), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, plain, "src/both.go", "", 3, 3), CBM_STORE_OK);
+
+    /* (a) Only unresolved_calls (plus a by-design row): no shadow project. */
+    cbm_coverage_row_t only_rows[] = {
+        {.rel_path = "src/a.go", .kind = "unresolved_calls", .detail = "[{\"candidate\":\"a.f\"}]"},
+        {.rel_path = "src/b.go", .kind = "unresolved_calls", .detail = "[{\"candidate\":\"b.g\"}]"},
+        {.rel_path = "vendor", .kind = "not_indexed_dir", .detail = "excluded subtree"},
+    };
+    ASSERT_EQ(cbm_store_coverage_replace(s, only, only_rows, 3), CBM_STORE_OK);
+    cbm_coverage_row_t *got = NULL;
+    int n = 0;
+    ASSERT_EQ(cbm_store_coverage_get(s, only, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 3); /* the table keeps the evidence; only the view skips it */
+    cbm_store_free_coverage(got, n);
+    ASSERT_EQ(cbm_store_count_nodes(s, "cov-unres-only::missed"), 0);
+    cbm_project_t shadow = {0};
+    ASSERT_EQ(cbm_store_get_project(s, "cov-unres-only::missed", &shadow), CBM_STORE_NOT_FOUND);
+    cbm_project_free_fields(&shadow);
+
+    /* (b) parse_partial + unresolved_calls on one path, and a second file
+     * with unresolved_calls only: the shadow holds exactly the parse_partial
+     * File node under src/. */
+    cbm_coverage_row_t mixed_rows[] = {
+        {.rel_path = "src/both.go", .kind = "parse_partial", .detail = "3-4"},
+        {.rel_path = "src/both.go",
+         .kind = "unresolved_calls",
+         .detail = "[{\"candidate\":\"both.h\"}]"},
+        {.rel_path = "lib/calls.go",
+         .kind = "unresolved_calls",
+         .detail = "[{\"candidate\":\"calls.k\"}]"},
+    };
+    ASSERT_EQ(cbm_store_coverage_replace(s, mixed, mixed_rows, 3), CBM_STORE_OK);
+    cbm_node_t *nodes = NULL;
+    int nc = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, "cov-unres-mixed::missed", "File", &nodes, &nc),
+              CBM_STORE_OK);
+    ASSERT_EQ(nc, 1);
+    ASSERT_STR_EQ(nodes[0].file_path, "src/both.go");
+    ASSERT_NOT_NULL(strstr(nodes[0].properties_json, "\"kind\":\"parse_partial\""));
+    ASSERT_NOT_NULL(strstr(nodes[0].properties_json, "\"detail\":\"3-4\""));
+    ASSERT_NULL(strstr(nodes[0].properties_json, "unresolved_calls"));
+    cbm_store_free_nodes(nodes, nc);
+    nodes = NULL;
+    nc = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, "cov-unres-mixed::missed", "Folder", &nodes, &nc),
+              CBM_STORE_OK);
+    ASSERT_EQ(nc, 1);
+    ASSERT_STR_EQ(nodes[0].name, "src");
+    cbm_store_free_nodes(nodes, nc);
+
+    /* (c) Same failure rows without the unresolved_calls evidence: the stored
+     * fingerprints match. */
+    cbm_coverage_row_t plain_row = {
+        .rel_path = "src/both.go", .kind = "parse_partial", .detail = "3-4"};
+    ASSERT_EQ(cbm_store_coverage_replace(s, plain, &plain_row, 1), CBM_STORE_OK);
+    char fp_mixed[128];
+    char fp_plain[128];
+    coverage_shadow_fp(s, mixed, fp_mixed, sizeof(fp_mixed));
+    coverage_shadow_fp(s, plain, fp_plain, sizeof(fp_plain));
+    ASSERT_TRUE(fp_plain[0] != '\0');
+    ASSERT_STR_EQ(fp_mixed, fp_plain);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_coverage_meta_indexed_checkout_sha_roundtrip_and_rollback) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "coverage-sha", "/tmp/coverage-sha"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-sha", "keep.c", "", 1, 1), CBM_STORE_OK);
+    cbm_coverage_row_t row = {.rel_path = "keep.c", .kind = "parse_partial", .detail = "1-2"};
+
+    /* NULL indexed_checkout_sha (non-git run) persists as NULL and reads back
+     * as no identity. */
+    cbm_coverage_meta_t no_sha_meta = {
+        .generation = "gen-0",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = 1,
+        .hash_records_complete = true,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-sha", &row, 1, &no_sha_meta),
+              CBM_STORE_OK);
+    cbm_coverage_meta_t got = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-sha", &got), CBM_STORE_OK);
+    ASSERT_NULL(got.indexed_checkout_sha);
+    cbm_store_coverage_meta_clear(&got);
+
+    /* Round-trip: git-run identity persists and can be overwritten by the next
+     * staged generation. */
+    cbm_coverage_meta_t sha_meta = no_sha_meta;
+    sha_meta.generation = "gen-1";
+    sha_meta.indexed_checkout_sha = "0123456789abcdef0123456789abcdef01234567";
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-sha", &row, 1, &sha_meta),
+              CBM_STORE_OK);
+    got = (cbm_coverage_meta_t){0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-sha", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.indexed_checkout_sha, "0123456789abcdef0123456789abcdef01234567");
+    ASSERT_STR_EQ(got.generation, "gen-1");
+    cbm_store_coverage_meta_clear(&got);
+
+    cbm_coverage_meta_t new_meta = sha_meta;
+    new_meta.generation = "gen-2";
+    new_meta.indexed_checkout_sha = "abcdef0123456789abcdef0123456789abcdef01";
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-sha", &row, 1, &new_meta),
+              CBM_STORE_OK);
+    got = (cbm_coverage_meta_t){0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-sha", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.indexed_checkout_sha, "abcdef0123456789abcdef0123456789abcdef01");
+    ASSERT_STR_EQ(got.generation, "gen-2");
+    cbm_store_coverage_meta_clear(&got);
+
+    /* Rollback: a failed replace must retain the prior identity + generation. */
+    ASSERT_EQ(cbm_store_exec(s, "CREATE TRIGGER fail_sha_missed_insert BEFORE INSERT ON nodes "
+                                "WHEN NEW.project = 'coverage-sha::missed' "
+                                "BEGIN SELECT RAISE(ABORT, 'forced sha shadow failure'); END;"),
+              CBM_STORE_OK);
+    cbm_coverage_meta_t failed_meta = new_meta;
+    failed_meta.generation = "gen-must-not-commit";
+    failed_meta.indexed_checkout_sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    cbm_coverage_row_t failed_row = row;
+    failed_row.detail = "changed-to-force-shadow-rebuild";
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-sha", &failed_row, 1, &failed_meta),
+              CBM_STORE_ERR);
+    got = (cbm_coverage_meta_t){0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-sha", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.generation, "gen-2");
+    ASSERT_STR_EQ(got.indexed_checkout_sha, "abcdef0123456789abcdef0123456789abcdef01");
+    cbm_store_coverage_meta_clear(&got);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(store_nodes) {
+    RUN_TEST(store_qn_suffix_is_literal);
+    RUN_TEST(store_qn_suffix_is_unbounded);
+    RUN_TEST(store_qn_base_finds_overloads_only);
     RUN_TEST(store_coverage_roundtrip_prune_shadow);
+    RUN_TEST(store_coverage_targeted_path_and_scope_lookup);
+    RUN_TEST(store_coverage_meta_zero_row_truncation_and_delete);
+    RUN_TEST(store_coverage_replace_rejects_invalid_row_arguments);
+    RUN_TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails);
+    RUN_TEST(store_coverage_shadow_excludes_unresolved_calls);
+    RUN_TEST(store_coverage_meta_indexed_checkout_sha_roundtrip_and_rollback);
+    RUN_TEST(sql_label_allowlists_match_cbm_label_is_type_like);
+    RUN_TEST(sql_relation_labels_match_cbm_label_is_relation);
     RUN_TEST(store_open_memory);
     RUN_TEST(store_close_null);
     RUN_TEST(store_open_memory_twice);
@@ -1678,6 +2796,9 @@ SUITE(store_nodes) {
     RUN_TEST(store_integrity_corrupt_bad_path);
     RUN_TEST(store_integrity_windows_lowercase_drive_issue367);
     RUN_TEST(store_integrity_corrupt_too_many_rows);
+    RUN_TEST(store_integrity_verdict_healthy_is_ok);
+    RUN_TEST(store_integrity_verdict_real_corruption_is_corrupt);
+    RUN_TEST(store_integrity_verdict_unopenable_is_transient_not_corrupt);
     RUN_TEST(store_integrity_null_check);
     RUN_TEST(store_project_crud);
     RUN_TEST(store_project_update);
@@ -1685,7 +2806,10 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_crud);
     RUN_TEST(store_node_dedup);
     RUN_TEST(store_node_find_by_label);
+    RUN_TEST(store_node_scan_streams_eager_scan_order);
     RUN_TEST(store_node_find_by_file);
+    RUN_TEST(store_file_outline_is_filtered_stable_bounded_and_cancellable_issue469);
+    RUN_TEST(store_file_outline_fails_closed_on_text_budget_issue469);
     RUN_TEST(store_node_find_not_found);
     RUN_TEST(store_node_count_empty);
     RUN_TEST(store_node_delete_by_file);
@@ -1694,6 +2818,8 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_batch_empty);
     RUN_TEST(store_cascade_delete);
     RUN_TEST(store_file_hash_crud);
+    RUN_TEST(store_lsp_surface_round_trip);
+    RUN_TEST(store_dependent_files_lookup);
     RUN_TEST(store_file_hash_upsert_rejects_null_required_fields);
     RUN_TEST(store_node_properties_json);
     RUN_TEST(store_node_null_properties);
@@ -1726,4 +2852,5 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_properties_special_chars);
     RUN_TEST(store_delete_nodes_nonexistent);
     RUN_TEST(store_count_nodes_unknown_project);
+    RUN_TEST(store_count_failed_read_is_not_zero);
 }

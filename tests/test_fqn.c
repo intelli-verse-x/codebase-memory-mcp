@@ -7,6 +7,8 @@
 #include "test_framework.h"
 #include "../src/pipeline/pipeline.h"
 #include "../src/foundation/str_util.h"
+#include "../src/foundation/arena.h"
+#include "helpers.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +28,25 @@
  * ================================================================ */
 
 /* ── Basic: project + path + name ─────────────────────────────── */
+
+/* A Dockerfile variant keeps its suffix in both QN implementations (the
+ * pipeline's fqn.c, the extractor's helpers.c) -- else it gets the QN of the
+ * plain Dockerfile beside it. */
+TEST(fqn_dockerfile_variant_keeps_suffix) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("p", "svc/Dockerfile.debug", "GOOS"),
+               "p.svc.Dockerfile.debug.GOOS");
+    ASSERT_FQN(cbm_pipeline_fqn_module("p", "svc/Containerfile.arm64"), "p.svc.Containerfile.arm64");
+    ASSERT_FQN(cbm_pipeline_fqn_module("p", "svc/Dockerfile"), "p.svc.Dockerfile");
+    ASSERT_FQN(cbm_pipeline_fqn_module("p", "svc/app.py"), "p.svc.app");
+    CBMArena a;
+    cbm_arena_init(&a);
+    ASSERT_STR_EQ(cbm_fqn_compute(&a, "p", "svc/Dockerfile.debug", "GOOS"),
+                  "p.svc.Dockerfile.debug.GOOS");
+    ASSERT_STR_EQ(cbm_fqn_module(&a, "p", "svc/Containerfile.arm64"), "p.svc.Containerfile.arm64");
+    ASSERT_STR_EQ(cbm_fqn_module(&a, "p", "svc/app.py"), "p.svc.app");
+    cbm_arena_destroy(&a);
+    PASS();
+}
 
 TEST(fqn_compute_basic_go) {
     ASSERT_FQN(cbm_pipeline_fqn_compute("myproj", "main.go", "main"), "myproj.main.main");
@@ -52,8 +73,126 @@ TEST(fqn_compute_basic_c) {
     PASS();
 }
 
+/* #1077/#964: File-node QNs (name=="__file__") must preserve the FULL filename
+ * so sibling files sharing a stem get DISTINCT nodes. Extension stripping is
+ * kept for module/symbol QNs (name!=__file__) — load-bearing for C/C++
+ * declaration↔definition resolution. */
+TEST(fqn_file_qn_preserves_dotfile_variants_issue1077) {
+    /* .env / .env.local / .env.production all stripped to ".env" before,
+     * colliding so only one File node survived per directory. */
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", ".env", "__file__"), "proj..env.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", ".env.local", "__file__"),
+               "proj..env.local.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", ".env.production", "__file__"),
+               "proj..env.production.__file__");
+    PASS();
+}
+
+TEST(fqn_file_qn_distinguishes_same_stem_header_source_issue964) {
+    /* NodeController.h and NodeController.cpp both stripped to
+     * "NodeController", so the header's File node was merged into the .cpp's. */
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "NodeController.h", "__file__"),
+               "proj.NodeController.h.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "NodeController.cpp", "__file__"),
+               "proj.NodeController.cpp.__file__");
+    PASS();
+}
+
+TEST(fqn_module_qn_still_strips_extension) {
+    /* The MODULE/symbol QN keeps stripping — unchanged by the File-QN fix. */
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "core.c", "init"), "proj.core.init");
+    ASSERT_FQN(cbm_pipeline_fqn_module("proj", "NodeController.cpp"), "proj.NodeController");
+    PASS();
+}
+
+TEST(fqn_relative_js_import_preserves_dotted_basename_issue1682) {
+    ASSERT_FQN(
+        cbm_pipeline_resolve_relative_import(
+            "packages/api/src/modules/consumer/consumer.service.ts", "../featureX/featureX.engine"),
+        "packages/api/src/modules/featureX/featureX.engine");
+    ASSERT_FQN(
+        cbm_pipeline_resolve_relative_import("packages/api/src/modules/moduleA/moduleA.service.ts",
+                                             "../moduleQ/moduleQ.service"),
+        "packages/api/src/modules/moduleQ/moduleQ.service");
+    ASSERT_FQN(cbm_pipeline_resolve_relative_import(
+                   "packages/api/src/modules/moduleA/moduleA.service.ts", "./create-thing.dto"),
+               "packages/api/src/modules/moduleA/create-thing.dto");
+    PASS();
+}
+
 TEST(fqn_compute_basic_rs) {
     ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "lib.rs", "new"), "proj.lib.new");
+    PASS();
+}
+
+TEST(fqn_compute_file_sibling_distinct) {
+    char *ts = cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.ts", "__file__");
+    char *html = cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.html", "__file__");
+    char *scss = cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.scss", "__file__");
+    ASSERT_NOT_NULL(ts);
+    ASSERT_NOT_NULL(html);
+    ASSERT_NOT_NULL(scss);
+    ASSERT_STR_NEQ(ts, html);
+    ASSERT_STR_NEQ(ts, scss);
+    ASSERT_STR_NEQ(html, scss);
+    free(ts);
+    free(html);
+    free(scss);
+    PASS();
+}
+
+TEST(fqn_compute_symbol_still_strips) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.ts", "BadgeComponent"),
+               "proj.app.badge.badge.component.BadgeComponent");
+    PASS();
+}
+
+TEST(fqn_module_siblings_still_share) {
+    ASSERT_FQN(cbm_pipeline_fqn_module("proj", "app/badge/badge.component.ts"),
+               "proj.app.badge.badge.component");
+    ASSERT_FQN(cbm_pipeline_fqn_module("proj", "app/badge/badge.component.html"),
+               "proj.app.badge.badge.component");
+    PASS();
+}
+
+/* #769: exact __file__ QNs for component siblings. */
+TEST(fqn_compute_file_sibling_exact) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.ts", "__file__"),
+               "proj.app.badge.badge.component.ts.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.html", "__file__"),
+               "proj.app.badge.badge.component.html.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.scss", "__file__"),
+               "proj.app.badge.badge.component.scss.__file__");
+    PASS();
+}
+
+TEST(fqn_compute_file_multi_extension) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/badge/badge.spec.ts", "__file__"),
+               "proj.app.badge.badge.spec.ts.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "archive.tar.gz", "__file__"),
+               "proj.archive.tar.gz.__file__");
+    PASS();
+}
+
+TEST(fqn_compute_file_no_extension) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "Makefile", "__file__"),
+               "proj.Makefile.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "LICENSE", "__file__"),
+               "proj.LICENSE.__file__");
+    PASS();
+}
+
+TEST(fqn_compute_file_dotfile) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", ".gitignore", "__file__"),
+               "proj..gitignore.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "config/.env", "__file__"),
+               "proj.config..env.__file__");
+    PASS();
+}
+
+TEST(fqn_compute_file_index_ts) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/index.ts", "__file__"),
+           "proj.app.index.ts.__file__");
     PASS();
 }
 
@@ -491,6 +630,23 @@ TEST(project_name_encodes_unicode_segments_issue571) {
     PASS();
 }
 
+TEST(project_name_unicode_segments_do_not_collide_issue571) {
+    char *first = cbm_project_name_from_path("/Users/dev/\xe5\xbc\x80\xe5\x8f\x91");
+    char *second = cbm_project_name_from_path("/Users/dev/\xe5\x90\x8e\xe7\xab\xaf");
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    ASSERT_STR_NEQ(first, second);
+    /* Distinct is not enough: each name must carry the hex image of its own
+     * non-ASCII segment, so the segment is preserved rather than replaced. */
+    ASSERT_NOT_NULL(strstr(first, "e5bc80e58f91"));
+    ASSERT_NOT_NULL(strstr(second, "e5908ee7abaf"));
+    ASSERT_TRUE(cbm_validate_project_name(first));
+    ASSERT_TRUE(cbm_validate_project_name(second));
+    free(first);
+    free(second);
+    PASS();
+}
+
 /* issue #624: #571 preserves non-ASCII path segments by hex-encoding each byte
  * (1 byte -> 2 hex chars), so a DEEP non-ASCII path triples in length and can
  * blow past the filesystem's 255-byte filename-component limit. Then
@@ -555,11 +711,24 @@ TEST(project_name_length_capped_issue624) {
 SUITE(fqn) {
     /* fqn_compute: basic extensions */
     RUN_TEST(fqn_compute_basic_go);
+    RUN_TEST(fqn_dockerfile_variant_keeps_suffix);
     RUN_TEST(fqn_compute_basic_py);
     RUN_TEST(fqn_compute_basic_ts);
     RUN_TEST(fqn_compute_basic_js);
     RUN_TEST(fqn_compute_basic_c);
+    RUN_TEST(fqn_file_qn_preserves_dotfile_variants_issue1077);
+    RUN_TEST(fqn_file_qn_distinguishes_same_stem_header_source_issue964);
+    RUN_TEST(fqn_module_qn_still_strips_extension);
+    RUN_TEST(fqn_relative_js_import_preserves_dotted_basename_issue1682);
     RUN_TEST(fqn_compute_basic_rs);
+    RUN_TEST(fqn_compute_file_sibling_distinct);
+    RUN_TEST(fqn_compute_symbol_still_strips);
+    RUN_TEST(fqn_module_siblings_still_share);
+    RUN_TEST(fqn_compute_file_sibling_exact);
+    RUN_TEST(fqn_compute_file_multi_extension);
+    RUN_TEST(fqn_compute_file_no_extension);
+    RUN_TEST(fqn_compute_file_dotfile);
+    RUN_TEST(fqn_compute_file_index_ts);
 
     /* fqn_compute: nested paths */
     RUN_TEST(fqn_compute_nested_two_levels);
@@ -650,6 +819,7 @@ SUITE(fqn) {
     RUN_TEST(project_name_deep_path);
     RUN_TEST(project_name_always_validator_safe_issue349);
     RUN_TEST(project_name_encodes_unicode_segments_issue571);
+    RUN_TEST(project_name_unicode_segments_do_not_collide_issue571);
     RUN_TEST(project_name_length_capped_issue624);
     RUN_TEST(project_name_colon_only);
     RUN_TEST(project_name_backslash_only);

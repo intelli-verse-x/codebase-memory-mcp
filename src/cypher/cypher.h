@@ -181,6 +181,13 @@ typedef struct {
     int rel_count;
 } cbm_pattern_t;
 
+/* One argument to a multi-argument scalar function (coalesce, substring, ...). */
+typedef struct {
+    const char *variable; /* variable reference (NULL if a literal) */
+    const char *property; /* property of the variable (NULL if whole var / literal) */
+    const char *literal;  /* literal string/number text (NULL if a variable ref) */
+} cbm_func_arg_t;
+
 /* WHERE condition */
 typedef struct {
     const char *variable;
@@ -188,13 +195,26 @@ typedef struct {
     const char *op; /* "=", "<>", "=~", "CONTAINS", "STARTS WITH", "ENDS WITH",
                        ">", "<", ">=", "<=", "IN", "IS NULL", "IS NOT NULL" */
     const char *value;
-    bool negated;           /* NOT prefix */
+    bool negated; /* NOT prefix */
+    /* coalesce(var.prop, literal) in WHERE (#874): when set, a missing/empty
+     * property value is substituted with this literal before the op runs. */
+    const char *coalesce_default;
     const char **in_values; /* IN [...] list */
     int in_value_count;
     /* EXISTS { (var)-[:value]->() } predicate (op=="EXISTS"): `variable` is the
      * anchor, `value` the edge type (NULL = any), `exists_dir` the direction
      * (0 = outbound, 1 = inbound, 2 = any). */
     int exists_dir;
+    /* Multi-arg scalar function on the LHS, e.g. coalesce(f.depth, 0) >= 2
+     * (#874). NULL func = plain variable/property LHS. */
+    const char *func;
+    cbm_func_arg_t *args;
+    int arg_count;
+    /* Property reference on the RHS, e.g. a.file_path = b.file_path (#2591).
+     * When rhs_variable is set the comparison reads its operand from the row
+     * instead of `value`; rhs_property NULL = bare alias. */
+    const char *rhs_variable;
+    const char *rhs_property;
 } cbm_condition_t;
 
 /* Expression tree for WHERE clause */
@@ -234,13 +254,6 @@ typedef struct {
     const char *else_val; /* NULL if no ELSE */
 } cbm_case_expr_t;
 
-/* One argument to a multi-argument scalar function (coalesce, substring, ...). */
-typedef struct {
-    const char *variable; /* variable reference (NULL if a literal) */
-    const char *property; /* property of the variable (NULL if whole var / literal) */
-    const char *literal;  /* literal string/number text (NULL if a variable ref) */
-} cbm_func_arg_t;
-
 /* RETURN item */
 typedef struct {
     const char *variable;
@@ -254,15 +267,23 @@ typedef struct {
     int arg_count;
 } cbm_return_item_t;
 
+/* Upper bound on ORDER BY sort keys. Queries with more keys are rejected at
+ * parse time: an unmodeled key must be a loud error, never a silently dropped
+ * remainder (#1334 - the unconsumed tail swallowed the LIMIT clause). */
+#define CBM_CYPHER_ORDER_KEYS_MAX 8
+
 typedef struct {
     cbm_return_item_t *items;
     int count;
     bool distinct;
-    bool star;             /* RETURN * */
-    const char *order_by;  /* "variable.property" or "COUNT(var)" or alias */
-    const char *order_dir; /* "ASC" or "DESC", NULL = default */
-    int skip;              /* SKIP N, 0 = none */
-    int limit;             /* 0 = default */
+    bool star; /* RETURN * */
+    /* ORDER BY key list, in priority order. Each key is "variable.property",
+     * "COUNT(var)" or an alias; direction is per key (Cypher semantics). */
+    const char *order_keys[CBM_CYPHER_ORDER_KEYS_MAX];
+    bool order_descs[CBM_CYPHER_ORDER_KEYS_MAX]; /* false = ASC (default) */
+    int order_key_count;                         /* 0 = no ORDER BY */
+    int skip;                                    /* SKIP N, 0 = none */
+    int limit;                                   /* 0 = default */
 } cbm_return_clause_t;
 
 /* Full query AST */
@@ -305,12 +326,21 @@ typedef struct {
     /* rows[row_idx][col_idx] = string value */
     const char ***rows;
     int row_count;
+    /* True when an internal row/candidate ceiling prevented exhaustive
+     * evaluation. A Cypher LIMIT is part of query semantics and does not set
+     * this flag by itself. */
+    bool truncated;
     /* Non-NULL when the query was rejected (e.g. result too large) */
     char *error;
+    /* Non-NULL advisory (caller-visible, not an error): e.g. a variable-
+     * length hop range was clamped to the engine ceiling (#797) — without
+     * this, a clamped expansion is indistinguishable from "no such path". */
+    char *warning;
 } cbm_cypher_result_t;
 
 /* Execute a Cypher query against a store.
- * max_rows: limit on output rows (0 = use virtual ceiling of 100k).
+ * max_rows: limit on output rows; 0 or any value above the 100k ceiling uses
+ *   the ceiling.
  * project: project name filter (NULL = all projects).
  * Returns -1 on error (check out->error for message). */
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
@@ -324,5 +354,25 @@ int cbm_cypher_parse(const char *query, cbm_query_t **out, char **error);
 
 /* Free a query AST. */
 void cbm_query_free(cbm_query_t *q);
+
+/* Test-only (#601): force the wall-clock execution budget in milliseconds for
+ * subsequent queries on the calling thread. 0 = trip on the first hot-loop
+ * check; a negative value restores the default budget. */
+void cbm_cypher_test_set_deadline_ms(int64_t budget_ms);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Override only the deadline clock on this thread; NULL restores real time. */
+typedef uint64_t (*cbm_cypher_test_clock_fn)(void);
+void cbm_cypher_test_set_deadline_clock(cbm_cypher_test_clock_fn clock_fn);
+/* Start nodes per streamed execution chunk on this thread; 0 restores the
+ * default. INT_MAX runs the whole start set as one chunk (a single pass). */
+void cbm_cypher_test_set_stream_chunk(int start_nodes);
+#endif
+
+/* Worst-case binding slot count for a node cross-join. Computes the count in
+ * size_t and rejects any that would not fit the int binding counter or would
+ * overflow the size_t byte size; returns 0 and writes *out_n on success,
+ * CBM_NOT_FOUND on overflow. Exposed for arithmetic-boundary unit tests. */
+int cbm_cypher_cross_join_alloc(int bind_count, int extra_count, bool opt, size_t *out_n);
 
 #endif /* CBM_CYPHER_H */
